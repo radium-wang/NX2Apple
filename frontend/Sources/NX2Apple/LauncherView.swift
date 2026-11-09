@@ -49,6 +49,7 @@ struct LauncherView: View {
     @StateObject var row = RowScroller()
     @StateObject var toolsAge: ToolsAge
     @State var signatureExpiry: [UUID: Date] = [:]   // installed apps' provisioning-profile expiry, per game
+    @State var signatureGeneration = 0   // drops an older background profile read that finishes after a newer one
     @State var resignNote: String?   // the last re-sign's outcome, shown under the hero's expiry line
     private var performStartupChecks: Bool
     private let onRunSetup: (() -> Void)?   // Settings' "Run setup again"; the root view supplies it
@@ -255,7 +256,11 @@ struct LauncherView: View {
             if performStartupChecks { checkTools() }
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .active { library.objectWillChange.send() }
+            if phase == .active {
+                if performStartupChecks { library.syncSharedApp(root: m.shellCachePath) }
+                readSignatures()
+                library.objectWillChange.send()
+            }
         }
         .alert(loc.t("library.error"), isPresented: Binding(
             get: { launchError != nil || library.error != nil },
@@ -302,6 +307,10 @@ struct LauncherView: View {
         .onChange(of: page) { page in
             padFocus.focused = nil
             if page != .library { closeArtwork(save: false) }
+            else {
+                if performStartupChecks { library.syncSharedApp(root: m.shellCachePath) }
+                readSignatures()
+            }
         }
         .onChange(of: artworkEditor?.gameID) { id in
             padFocus.scope = id != nil ? "artwork" : currentPadScope
@@ -680,14 +689,25 @@ struct LauncherView: View {
         } catch { launchError = error.localizedDescription }
     }
 
-    /// The installed apps' profile expiries, read in the background: `security cms` per unique app path, so not in a view body.
-    private func readSignatures() {
+    /// The installed apps' profile expiries, read in the background: one profile parse per unique app path, so not in a view body.
+    func readSignatures() {
         let apps = library.games.filter(\.onDevice).map { ($0.id, $0.iosAppPath) }
-        guard !apps.isEmpty else { signatureExpiry = [:]; return }
+        guard !apps.isEmpty else {
+            if !signatureExpiry.isEmpty {
+                signatureGeneration += 1
+                signatureExpiry = [:]
+            }
+            return
+        }
+        signatureGeneration += 1
+        let gen = signatureGeneration
         let runner = stores.runner
         DispatchQueue.global(qos: .utility).async {
             let found = AppSignature.expirations(ofApps: apps, runner: runner)
-            DispatchQueue.main.async { signatureExpiry = found }
+            DispatchQueue.main.async {
+                guard gen == signatureGeneration else { return }
+                if signatureExpiry != found { signatureExpiry = found }
+            }
         }
     }
 

@@ -916,6 +916,7 @@ import NXModel
         let modelStores = LauncherStores(xcrun: f.xcrun, defaults: testDefaults); let model = modelStores.build
         modelStores.repo.path = f.repo
         model.target = "ios"
+        model.home = path("home")
         model.outDir = path("out")
         modelStores.dependencies.pythonPath = "/usr/bin/python3"
         modelStores.dependencies.dotnetPath = "/usr/bin/true"
@@ -970,10 +971,29 @@ import NXModel
         try fm.createSymbolicLink(atPath: pkgLink, withDestinationPath: translocated)
         try fm.createSymbolicLink(atPath: shellLink, withDestinationPath: "/private/var/folders/xx/T/AppTranslocation/2CFF0344-0DA8/Shell")
         try write(container + "/org.nxnative.shell/Documents/save/slot1.bin", "my save")
+        model.home = path("home")
+        let cachedProfiles = model.home + "/Library/Developer/Xcode/UserData/Provisioning Profiles"
+        try fm.createDirectory(atPath: cachedProfiles, withIntermediateDirectories: true)
+        let staleProfile = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "UUID": "STALE-UUID",
+                "Name": "iOS Team Provisioning Profile: org.nxnative.shell",
+                "TeamIdentifier": [team],
+                "Entitlements": ["application-identifier": "\(team).org.nxnative.shell"],
+                "ExpirationDate": Date(timeIntervalSince1970: 1_900_000_000)
+            ],
+            format: .xml,
+            options: 0
+        )
+        try staleProfile.write(to: URL(fileURLWithPath: cachedProfiles + "/STALE-UUID.mobileprovision"))
+        try staleProfile.write(to: URL(fileURLWithPath: model.installedAppPath + "/embedded.mobileprovision"))
         let before = calls.count
         let resigned = expectation(description: "Re-signed")
         model.resignOnDevice(app: model.installedAppPath, device: device) { resigned.fulfill() }
         wait(for: [resigned], timeout: 30)
+        XCTAssertFalse(fm.fileExists(atPath: cachedProfiles + "/STALE-UUID.mobileprovision"),
+                       "stale cached profile must be cleared so Xcode requests a fresh 7-day profile")
+        XCTAssertEqual(ShellLibrary.installedReceipt(root: f.root), [titleID])
         let log = Array(calls.dropFirst(before))
         let build = try XCTUnwrap(log.first { $0.hasPrefix("xcodebuild") })
         XCTAssertTrue(build.contains("-project \(f.root)/project/DmShell.xcodeproj -scheme DmShell"), build)
@@ -1012,6 +1032,7 @@ import NXModel
         let modelStores = LauncherStores(xcrun: f.xcrun, defaults: testDefaults); let model = modelStores.build
         modelStores.repo.path = f.repo
         model.target = "ios"
+        model.home = path("home")
         model.outDir = path("out")
         modelStores.dependencies.pythonPath = "/usr/bin/python3"
         modelStores.dependencies.dotnetPath = "/usr/bin/true"
