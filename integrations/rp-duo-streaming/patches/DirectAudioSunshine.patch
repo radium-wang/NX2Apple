@@ -1,8 +1,8 @@
 diff --git a/src/platform/macos/microphone.mm b/src/platform/macos/microphone.mm
-index 72776e7..b44fab3 100644
+index 72776e7..8bf821d 100644
 --- a/src/platform/macos/microphone.mm
 +++ b/src/platform/macos/microphone.mm
-@@ -2,15 +2,176 @@
+@@ -2,15 +2,193 @@
   * @file src/platform/macos/microphone.mm
   * @brief Definitions for microphone capture on macOS.
   */
@@ -50,9 +50,11 @@ index 72776e7..b44fab3 100644
 +    using clock = std::chrono::steady_clock;
 +
 +    ~relay_mic_t() override {
-+      if (buffer.underruns || buffer.overruns || stale_packets) {
++      if (buffer.underruns || buffer.overruns || stale_packets || buffer.smoothed_frames || resyncs || peak_late >= 5ms) {
 +        BOOST_LOG(info) << "NX2Apple audio relay: underruns="sv << buffer.underruns
-+                        << ", overruns="sv << buffer.overruns << ", stale packets="sv << stale_packets;
++                        << ", overruns="sv << buffer.overruns << ", stale packets="sv << stale_packets
++                        << ", smoothed frames="sv << buffer.smoothed_frames << ", resyncs="sv << resyncs
++                        << ", max capture delay="sv << std::chrono::duration_cast<std::chrono::milliseconds>(peak_late).count() << " ms"sv;
 +      }
 +      if (socket_fd >= 0) {
 +        close(socket_fd);
@@ -109,25 +111,37 @@ index 72776e7..b44fab3 100644
 +     */
 +    capture_e sample(std::vector<float> &output) override {
 +      const auto now = clock::now();
-+      const auto late = now - deadline;
-+      if (late > 20ms) {
++      std::uint64_t discard_before = 0;
++      if (deadline == clock::time_point {}) {
 +        deadline = now;
-+        // Re-anchor the encoder clock without throwing away fresh PCM during a short scheduling stall.
-+        if (late > 60ms) {
++      } else {
++        const auto late = now - deadline;
++        peak_late = std::max(peak_late, late);
++        // Keep the encoder cadence across short scheduling stalls. Moving the deadline to now
++        // after every stall would accumulate that lost playback time in the PCM queue.
++        if (late > 100ms) {
++          deadline = now;
 +          buffer.reset();
++          const auto uptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++          constexpr auto recovery_window_ns = rpduo_audio::buffer_t::prebuffer_blocks * 5000000ull;
++          discard_before = uptime > recovery_window_ns ? uptime - recovery_window_ns : 0;
++          ++resyncs;
 +        }
 +      }
 +      deadline += std::chrono::nanoseconds(output.size() * 1000000000ull / 96000);
-+      receive_packets();
++      receive_packets(discard_before);
 +      std::this_thread::sleep_until(deadline);
 +      buffer.read(output);
 +      return capture_e::ok;
 +    }
 +
 +  private:
-+    /** @brief Gather complete packets until the current encoder deadline. */
-+    void receive_packets() {
-+      while (clock::now() < deadline) {
++    /**
++     * @brief Drain available packets even if the encoder deadline has already passed.
++     * @param discard_before Drop datagrams older than this uptime after a long interruption.
++     */
++    void receive_packets(std::uint64_t discard_before) {
++      for (int received_count = 0; received_count < 128; ++received_count) {
 +        // A larger receive buffer lets us recognize and reject truncated datagrams.
 +        struct {
 +          packet_t value;
@@ -136,7 +150,8 @@ index 72776e7..b44fab3 100644
 +        const auto size = recv(socket_fd, &received, sizeof received, MSG_DONTWAIT);
 +        if (size == static_cast<ssize_t>(sizeof(packet_t))) {
 +          const auto now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-+          if (received.value.uptime_ns > now_ns || now_ns - received.value.uptime_ns > 80000000ull) {
++          if (received.value.uptime_ns > now_ns || received.value.uptime_ns < discard_before ||
++              now_ns - received.value.uptime_ns > 120000000ull) {
 +            ++stale_packets;
 +            continue;
 +          }
@@ -172,6 +187,8 @@ index 72776e7..b44fab3 100644
 +    struct stat socket_file {};  ///< Identity of this stream's own endpoint.
 +    rpduo_audio::buffer_t buffer;  ///< PCM waiting for the encoder.
 +    std::uint64_t stale_packets {};  ///< Packets too far behind the host clock.
++    std::uint64_t resyncs {};  ///< Number of severe interruptions that reset playback.
++    clock::duration peak_late {};  ///< Longest interruption of the capture loop.
 +    clock::time_point deadline {};  ///< Next negotiated delivery time.
 +    bool reported_audio {};  ///< Whether we verified that the game sent nonzero PCM.
 +  };
@@ -179,7 +196,7 @@ index 72776e7..b44fab3 100644
    /**
     * @brief macOS microphone capture device and audio format state.
     */
-@@ -93,6 +254,16 @@ int set_sink(const std::string &sink) override {
+@@ -93,6 +271,16 @@ int set_sink(const std::string &sink) override {
       * @return Microphone capture object for the requested audio layout.
       */
      std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, bool host_audio_enabled) override {
@@ -198,10 +215,10 @@ index 72776e7..b44fab3 100644
  
 diff --git a/src/platform/macos/rpduo_audio_buffer.h b/src/platform/macos/rpduo_audio_buffer.h
 new file mode 100644
-index 0000000..4066998
+index 0000000..5750f78
 --- /dev/null
 +++ b/src/platform/macos/rpduo_audio_buffer.h
-@@ -0,0 +1,103 @@
+@@ -0,0 +1,138 @@
 +/**
 + * @file src/platform/macos/rpduo_audio_buffer.h
 + * @brief Bound timing variation between the NX2Apple PCM producer and the Opus encoder.
@@ -220,7 +237,8 @@ index 0000000..4066998
 +  public:
 +    static constexpr std::size_t channels = 2;  ///< Number of interleaved channels.
 +    static constexpr std::size_t block_samples = 480;  ///< 5 ms of 48 kHz stereo PCM.
-+    static constexpr std::size_t prebuffer_blocks = 5;  ///< 25 ms before starting or resuming.
++    static constexpr std::size_t prebuffer_blocks = 7;  ///< 35 ms before starting or resuming.
++    static constexpr std::size_t maximum_blocks = 32;  ///< Emergency capacity, not the target latency.
 +    using block_t = std::array<std::int16_t, block_samples>;
 +
 +    /** @brief Add one ordered block, discarding old audio on excessive queue growth. */
@@ -249,11 +267,19 @@ index 0000000..4066998
 +     * @param output Interleaved stereo float output.
 +     */
 +    void read(std::span<float> output) {
-+      if (!ready && size * block_samples - offset >= std::max(prebuffer_blocks * block_samples, output.size())) {
++      const auto available = size * block_samples - offset;
++      if (!ready && available >= std::max(prebuffer_blocks * block_samples, output.size())) {
 +        ready = true;
 +        fade_in = fade_frames;
 +        fade_in_origin = last;
 +      }
++      // Keep the nominal queue intact through ordinary jitter. If audio stays ahead of playback,
++      // overlap it with the next millisecond to shorten the queue without a packet-sized skip.
++      constexpr std::size_t trim_frames = 48;  // One millisecond at 48 kHz.
++      constexpr std::size_t high_water = 13 * block_samples;  // 65 ms.
++      const auto overlap = std::min(fade_frames, output.size() / channels);
++      const bool trim = ready && !fade_in && overlap && available > high_water &&
++                        available >= output.size() + trim_frames * channels;
 +      for (std::size_t index = 0; index < output.size(); index += channels) {
 +        if (ready && size == 0) {
 +          ready = false;
@@ -261,20 +287,24 @@ index 0000000..4066998
 +        }
 +        if (ready) {
 +          const float gain = 1.0f - fade_in / static_cast<float>(fade_frames);
++          const auto overlap_index = index / channels;
 +          for (std::size_t channel = 0; channel < channels; ++channel) {
-+            const auto sample = blocks[head][offset + channel] / 32768.0f;
-+            last[channel] = fade_in_origin[channel] * (1.0f - gain) + sample * gain;
++            float value = sample(channel);
++            if (trim && overlap_index < overlap) {
++              const float mix = (overlap_index + 1) / static_cast<float>(overlap);
++              value += (sample(trim_frames * channels + channel) - value) * mix;
++            }
++            last[channel] = fade_in_origin[channel] * (1.0f - gain) + value * gain;
 +            output[index + channel] = fade_out_origin[channel] = last[channel];
 +          }
 +          fade_out = fade_frames;
 +          if (fade_in) {
 +            --fade_in;
 +          }
-+          offset += channels;
-+          if (offset == block_samples) {
-+            offset = 0;
-+            head = (head + 1) % blocks.size();
-+            --size;
++          consume(channels);
++          if (trim && overlap_index + 1 == overlap) {
++            consume(trim_frames * channels);
++            smoothed_frames += trim_frames;
 +          }
 +        } else {
 +          const float gain = fade_out / static_cast<float>(fade_frames);
@@ -290,10 +320,32 @@ index 0000000..4066998
 +
 +    std::uint64_t underruns {};  ///< Number of times playback ran out of buffered samples.
 +    std::uint64_t overruns {};  ///< Number of times queued audio was trimmed.
++    std::uint64_t smoothed_frames {};  ///< Stereo sample frames removed with a short overlap.
 +
 +  private:
++    /**
++     * @brief Read a sample relative to the playback cursor from the interleaved queue.
++     * @param ahead Distance from the cursor in individual channel samples.
++     */
++    float sample(std::size_t ahead) const {
++      const auto position = offset + ahead;
++      return blocks[(head + position / block_samples) % blocks.size()][position % block_samples] / 32768.0f;
++    }
++
++    /**
++     * @brief Advance the playback cursor by samples known to be available.
++     * @param count Number of individual channel samples to consume.
++     */
++    void consume(std::size_t count) {
++      const auto next = offset + count;
++      const auto consumed_blocks = next / block_samples;
++      offset = next % block_samples;
++      head = (head + consumed_blocks) % blocks.size();
++      size -= consumed_blocks;
++    }
++
 +    static constexpr std::size_t fade_frames = 96;  ///< 2 ms transition at 48 kHz.
-+    std::array<block_t, 16> blocks {};  ///< At most 80 ms of pending PCM.
++    std::array<block_t, maximum_blocks> blocks {};  ///< Bounded storage for pending PCM.
 +    std::size_t head {};  ///< First block in the queue.
 +    std::size_t size {};  ///< Number of blocks in the queue.
 +    std::size_t offset {};  ///< First unplayed sample in the head block.

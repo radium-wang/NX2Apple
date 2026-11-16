@@ -30,6 +30,13 @@ Set `controller = enabled` and `gamepad_driver = none` in Sunshine, and launch
 the rebuilt Mac game with `DM_RP_DUO=1`. Connect with the patched Artemis.
 See [the wire format](PROTOCOL.md) for the local socket and transport details.
 
+For standard controller rumble on RP Duo, Moonlight preserves start and stop
+edges even when it coalesces queued intensity changes. Artemis mixes the
+full 16-bit motor levels before mapping to the Duo's built-in motor. A
+nonzero pulse gets at least 20 ms of playback. Session teardown still
+cancels immediately. The separate raw haptics receiver keeps its own
+thresholds and timing.
+
 ## Direct game video on macOS
 
 ### NX2Apple launcher integration
@@ -80,11 +87,14 @@ The game sends 48 kHz stereo PCM to Sunshine, which uses its normal Opus
 stream. Enable `stream_audio` in Sunshine. This direct profile uses the
 game's audio output and does not capture the system mix.
 
-Sunshine gathers 25 ms of game audio before playing it so normal timing
-variation on the Mac does not insert silent blocks. If the audio runs out,
-the relay briefly fades and refills before playing again. The log reports
-underruns, overruns and stale packets when the stream ends. Existing games
-use the new buffer with an updated Sunshine binary.
+Sunshine gathers 35 ms of game audio before playing it. It drains the socket
+after a missed deadline and catches up with the existing encoder schedule.
+When the queue runs ahead of playback, the relay shortens it in 1 ms steps
+with a crossfade. After a capture interruption longer than 100 ms, it
+discards the old backlog and resumes with recent audio. The session log
+reports buffer underruns, overruns, stale packets, samples removed with a
+crossfade, resyncs and the longest capture delay. Existing games use the new
+buffer with an updated Sunshine binary.
 
 The buffer regression test runs against the patched Sunshine source tree:
 
@@ -92,6 +102,13 @@ The buffer regression test runs against the patched Sunshine source tree:
 clang++ -std=c++23 -I /path/to/Sunshine tests/DirectAudioBufferTest.cpp -o /tmp/direct-audio-test
 /tmp/direct-audio-test
 ```
+
+In a six-second local Unix socket test with up to 17 ms of producer jitter
+and a 28 ms capture pause every 450 ms, two runs each delivered 1,193
+stereo PCM blocks in order without loss or inserted silence. Adding two
+110 ms capture pauses caused two resyncs, 33 stale blocks to be discarded,
+and six 1 ms crossfades. That run had no buffer underruns or inserted
+silence. The test covers game audio reception up to the encoder input.
 
 Use a different Sunshine port and separate state when testing alongside
 desktop streaming. The direct source is enabled for the entire test process.

@@ -1,5 +1,5 @@
 diff --git a/src/ControlStream.c b/src/ControlStream.c
-index 1f6d397..1a5b800 100644
+index 1f6d397..92de71b 100644
 --- a/src/ControlStream.c
 +++ b/src/ControlStream.c
 @@ -1,4 +1,5 @@
@@ -16,7 +16,7 @@ index 1f6d397..1a5b800 100644
      union {
          struct {
              uint16_t controllerNumber;
-@@ -907,6 +909,9 @@ static void asyncCallbackThreadFunc(void* context) {
+@@ -907,12 +909,18 @@ static void asyncCallbackThreadFunc(void* context) {
  
      while (LbqWaitForQueueElement(&asyncCallbackQueue, (void**)&queuedCb) == LBQ_SUCCESS) {
          switch (queuedCb->typeIndex) {
@@ -26,7 +26,17 @@ index 1f6d397..1a5b800 100644
          case IDX_RUMBLE_DATA:
              // Look for another rumble packet to batch with
              while (LbqPeekQueueElement(&asyncCallbackQueue, (void**)&nextCb) == LBQ_SUCCESS) {
-@@ -1019,7 +1024,7 @@ static void asyncCallbackThreadFunc(void* context) {
+                 // Don't batch with the next packet if it is a different type or controller number
++                // Keep start and stop edges when both arrived before this callback could run.
+                 if (nextCb->typeIndex != queuedCb->typeIndex ||
+-                        nextCb->data.rumble.controllerNumber != queuedCb->data.rumble.controllerNumber) {
++                        nextCb->data.rumble.controllerNumber != queuedCb->data.rumble.controllerNumber ||
++                        (!nextCb->data.rumble.lowFreqRumble && !nextCb->data.rumble.highFreqRumble) !=
++                        (!queuedCb->data.rumble.lowFreqRumble && !queuedCb->data.rumble.highFreqRumble)) {
+                     break;
+                 }
+ 
+@@ -1019,7 +1027,7 @@ static void asyncCallbackThreadFunc(void* context) {
  }
  
  static bool needsAsyncCallback(unsigned short packetType) {
@@ -35,7 +45,7 @@ index 1f6d397..1a5b800 100644
             packetType == packetTypes[IDX_RUMBLE_TRIGGER_DATA] ||
             packetType == packetTypes[IDX_SET_MOTION_EVENT] ||
             packetType == packetTypes[IDX_SET_RGB_LED] ||
-@@ -1036,6 +1041,9 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
+@@ -1036,6 +1044,9 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
  
      LC_ASSERT(needsAsyncCallback(ctlHdr->type));
  
@@ -45,7 +55,7 @@ index 1f6d397..1a5b800 100644
      queuedCb = malloc(sizeof(*queuedCb));
      if (!queuedCb) {
          return;
-@@ -1043,7 +1051,11 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
+@@ -1043,7 +1054,11 @@ static void queueAsyncCallback(PNVCTL_ENET_PACKET_HEADER_V1 ctlHdr, int packetLe
  
      BbInitializeWrappedBuffer(&bb, (char*)ctlHdr, sizeof(*ctlHdr), packetLength - sizeof(*ctlHdr), BYTE_ORDER_LITTLE);
  

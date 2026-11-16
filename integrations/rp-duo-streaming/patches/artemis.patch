@@ -18,7 +18,7 @@ index c706dbf..3346727 100644
              minifyEnabled true
              proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
 diff --git a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
-index b084917..734a4cb 100755
+index b084917..43aee78 100755
 --- a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
 +++ b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
 @@ -127,6 +127,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
@@ -68,18 +68,18 @@ index b084917..734a4cb 100755
              context.vibrator = deviceVibrator;
          } else {
              // Try to use the InputDevice's associated vibrators first
-@@ -2113,6 +2130,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
-         short highFreqMotorMSB = (short)((highFreqMotor >> 8) & 0xFF);
-         int simulatedAmplitude = Math.min(255, (int)((lowFreqMotorMSB * 0.80) + (highFreqMotorMSB * 0.33)));
+@@ -2106,6 +2123,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+     }
  
+     private void rumbleSingleVibrator(Vibrator vibrator, short lowFreqMotor, short highFreqMotor) {
 +        if (retroidDuoRumble != null && vibrator == deviceVibrator) {
-+            retroidDuoRumble.setMagnitude(simulatedAmplitude);
++            retroidDuoRumble.setControllerMagnitudes(lowFreqMotor, highFreqMotor);
 +            return;
 +        }
 +
-         if (simulatedAmplitude == 0) {
-             // This case is easy - just cancel the current effect and get out.
-             // NB: We cannot simply check lowFreqMotor == highFreqMotor == 0
+         // Since we can only use a single amplitude value, compute the desired amplitude
+         // by taking 80% of the big motor and 33% of the small motor, then capping to 255.
+         // NB: This value is now 0-255 as required by VibrationEffect.
 diff --git a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
 index de2f617..277fe8a 100755
 --- a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java

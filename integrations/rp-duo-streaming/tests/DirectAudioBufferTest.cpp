@@ -74,12 +74,34 @@ namespace {
   void overrun_discards_the_oldest_audio() {
     buffer_t queue;
     std::array<float, buffer_t::block_samples> output;
-    for (int block = 0; block < 17; ++block) {
+    for (std::size_t block = 0; block <= buffer_t::maximum_blocks; ++block) {
       queue.push(audio_block(block));
     }
     assert(queue.overruns == 1);
     queue.read(output);
-    assert(output.back() == audio_block(12).back() / 32768.0f);
+    const auto first_recent_block = buffer_t::maximum_blocks - buffer_t::prebuffer_blocks + 1;
+    assert(output.back() == audio_block(first_recent_block).back() / 32768.0f);
+  }
+
+  void sustained_pressure_shortens_continuous_stereo_audio() {
+    buffer_t queue;
+    std::array<float, buffer_t::block_samples> output;
+    for (std::size_t block = 0; block < buffer_t::prebuffer_blocks; ++block) {
+      queue.push(audio_block(block));
+    }
+    queue.read(output);
+    for (std::size_t block = buffer_t::prebuffer_blocks; block < 15; ++block) {
+      queue.push(audio_block(block));
+    }
+    queue.read(output);
+    assert(queue.smoothed_frames == 48 && queue.overruns == 0);
+    const auto next = audio_block(2);
+    assert(output.back() == next[(48 * buffer_t::channels) - 1] / 32768.0f);
+    for (std::size_t index = 0; index + 2 < output.size(); index += buffer_t::channels) {
+      assert(output[index] == -output[index + 1]);
+      // A 1 ms skip on this waveform would jump 48 sample values. The crossfade stays continuous.
+      assert((output[index + 2] - output[index]) * 32768.0f < 2.1f);
+    }
   }
 }  // namespace
 
@@ -87,4 +109,5 @@ int main() {
   producer_jitter_preserves_every_stereo_sample();
   signal_loss_fades_and_refills();
   overrun_discards_the_oldest_audio();
+  sustained_pressure_shortens_continuous_stereo_audio();
 }
