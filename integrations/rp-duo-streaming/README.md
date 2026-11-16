@@ -54,7 +54,10 @@ native launcher. Its own direct-enabled `dmhost` must match its title build
 and shader chain. The generic entry works across compatible Mac game builds.
 
 The embedded Mac build variant for 1.4.0 is based on the exact official
-bundled engine. Apply `DirectProducer-v1.4.0.patch` and
+bundled engine. This branch's local and release packaging call
+`integrations/rp-duo-streaming/bundle-mac-engine.sh` with the base engine tree and the
+launcher's Resources directory. To reproduce the variant by hand, apply
+`DirectProducer-v1.4.0.patch` and
 `DirectHaptics-v1.4.0.patch` to a copy of that engine, in order. Copy
 `source/nx2apple/dm/host/rpduo_haptics_mac.h` to its `dm/host/` directory.
 Place the copy at `Contents/Resources/rpduo-engine` in the launcher, preserve
@@ -133,6 +136,16 @@ stereo PCM blocks in order without loss or inserted silence. Adding two
 110 ms capture pauses caused two resyncs, 33 stale blocks to be discarded,
 and six 1 ms crossfades. That run had no buffer underruns or inserted
 silence. The test covers game audio reception up to the encoder input.
+
+The optional `DirectAudioDiagnostics.patch` applies after the direct-audio
+patch. It keeps the 35 ms startup buffer and logs ten-second summaries
+during an active direct stream. The relay reports cumulative buffer events
+and the largest capture delay and incoming PCM packet age for each window.
+The Opus worker reports missed capture-queue items from their sequence
+numbers, time spent waiting in that queue, and time spent encoding. The
+UDP worker reports data-packet send failures and send timing. The Opus and
+UDP reports count gaps longer than two negotiated packet periods and bursts
+closer together than half a period. The logs contain timing and counts.
 
 Use a different Sunshine port and separate state when testing alongside
 desktop streaming. The direct source is enabled for the entire test process.

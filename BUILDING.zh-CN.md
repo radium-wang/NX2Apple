@@ -4,7 +4,7 @@
 
 ## 构建带原始震动的 RP Duo 直传游戏
 
-在带 RP Duo 构建引擎的 NX2Apple 中，按普通流程构建 Mac 游戏。手动构建 1.4.0 时，在对应引擎上先应用 `DirectProducer-v1.4.0.patch`，再应用 `DirectHaptics-v1.4.0.patch`，并复制 `rpduo_haptics_mac.h` 到 `dm/host/`。维护已打包的旧游戏时，用该游戏版本和着色器链对应的引擎重建其 `dmhost`，按旧版顺序应用补丁并重新签名游戏包。[补丁顺序与构建命令](integrations/rp-duo-streaming/README.md#direct-game-video-on-macos)
+在带 RP Duo 构建引擎的 NX2Apple 中，按普通流程构建 Mac 游戏。此分支的 `tools/try-local` 和 macOS 打包工作流会为配套的 1.4.0 引擎自动打包直传版本。手动打包启动器可调用 `integrations/rp-duo-streaming/bundle-mac-engine.sh`，传入引擎树和应用的 `Contents/Resources` 目录。维护已打包的旧游戏时，用该游戏版本和着色器链对应的引擎重建其 `dmhost`，按旧版顺序应用补丁并重新签名游戏包。[补丁顺序与构建命令](integrations/rp-duo-streaming/README.md#direct-game-video-on-macos)
 
 产物检查时，对游戏包的 `Contents/MacOS/dmhost` 运行 `strings`，确认包含 `DM_RP_DUO_RAW_HAPTICS`。用配套 Sunshine 和 Artemis 串流，确认游戏日志出现 `player 1 uses RP Duo direct four-band stream`。回归时检查游戏手柄输入、弱震动、短脉冲和停振各一次。Duo 的马达输出随固件公开能力，现用固件按原始脉冲节奏播放。[协议与验收字段](integrations/rp-duo-streaming/PROTOCOL.md)
 

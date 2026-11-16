@@ -1,0 +1,287 @@
+diff --git a/src/audio.cpp b/src/audio.cpp
+--- a/src/audio.cpp
++++ b/src/audio.cpp
+@@ -15,6 +15,7 @@
+ #include "globals.h"
+ #include "logging.h"
+ #include "platform/common.h"
++#include "rpduo_audio_diagnostics.h"
+ #include "thread_safe.h"
+ #include "utility.h"
+ 
+@@ -25,9 +26,15 @@
+    */
+   using opus_t = util::safe_ptr<OpusMSEncoder, opus_multistream_encoder_destroy>;
+   /**
+-   * @brief Shared queue carrying captured PCM sample buffers to the encoder thread.
+-   */
+-  using sample_queue_t = std::shared_ptr<safe::queue_t<std::vector<float>>>;
++   * @brief Captured PCM and its timing before encoding.
++   */
++  struct pcm_sample_t {
++    std::vector<float> samples;  ///< Interleaved PCM data passed to Opus.
++    std::uint64_t sequence;  ///< Capture index for identifying dropped queue items.
++    rpduo_audio_diagnostics::clock::time_point enqueued;  ///< Time queued by the capture thread.
++  };
++  /** @brief Queue carrying captured PCM to the encoder thread. */
++  using sample_queue_t = std::shared_ptr<safe::queue_t<pcm_sample_t>>;
+ 
+   static int start_audio_control(audio_ctx_t &ctx);
+   static void stop_audio_control(audio_ctx_t &);
+@@ -136,10 +143,20 @@
+                     << stream.bitrate / 1000 << " kbps (total), LOWDELAY"sv;
+ 
+     auto frame_size = config.packetDuration * stream.sampleRate / 1000;
++    const auto period = std::chrono::milliseconds(config.packetDuration);
++    const auto direct = rpduo_audio_diagnostics::enabled();
++    rpduo_audio_diagnostics::window_t encode_timing;
++    std::uint64_t next_sequence = 0;
+     while (auto sample = samples->pop()) {
+       buffer_t packet {1400};
+ 
+-      int bytes = opus_multistream_encode_float(opus.get(), sample->data(), frame_size, std::begin(packet), (opus_int32) packet.size());
++      const auto started = direct ? rpduo_audio_diagnostics::clock::now() : rpduo_audio_diagnostics::clock::time_point {};
++      int bytes = opus_multistream_encode_float(opus.get(), sample->samples.data(), frame_size, std::begin(packet), (opus_int32) packet.size());
++      if (direct) {
++        encode_timing.record("Opus", started, period, started - sample->enqueued,
++                             rpduo_audio_diagnostics::clock::now() - started, sample->sequence - next_sequence);
++        next_sequence = sample->sequence + 1;
++      }
+       if (bytes < 0) {
+         BOOST_LOG(error) << "Couldn't encode audio: "sv << opus_strerror(bytes);
+         packets->stop();
+@@ -245,6 +262,8 @@
+     });
+ 
+     int samples_per_frame = frame_size * stream.channelCount;
++    const auto direct = rpduo_audio_diagnostics::enabled();
++    std::uint64_t sequence = 0;
+ 
+     while (!shutdown_event->peek()) {
+       std::vector<float> sample_buffer;
+@@ -270,7 +289,8 @@
+           return;
+       }
+ 
+-      samples->raise(std::move(sample_buffer));
++      const auto enqueued = direct ? rpduo_audio_diagnostics::clock::now() : rpduo_audio_diagnostics::clock::time_point {};
++      samples->raise(pcm_sample_t {std::move(sample_buffer), sequence++, enqueued});
+     }
+   }
+ 
+diff --git a/src/stream.cpp b/src/stream.cpp
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -30,6 +30,7 @@
+ #include "network.h"
+ #include "platform/common.h"
+ #include "process.h"
++#include "rpduo_audio_diagnostics.h"
+ #include "stream.h"
+ #ifdef __APPLE__
+   #include "raw_haptics_ingress.h"
+@@ -546,6 +547,7 @@
+ 
+       audio_fec_packet_t fec_packet;  ///< Reusable packet header for audio forward-error-correction shards.
+       std::unique_ptr<platf::deinit_t> qos;  ///< Lifetime guard for audio-socket QoS configuration.
++      rpduo_audio_diagnostics::window_t send_timing;  ///< Periodic direct audio send counters.
+     } audio;  ///< Audio capture configuration for the stream..
+ 
+     struct {
+@@ -1995,6 +1997,7 @@
+     // Audio traffic is sent on this thread
+     platf::set_thread_name("stream::audioBroadcast");
+     platf::adjust_thread_priority(platf::thread_priority_e::high);
++    const auto direct = rpduo_audio_diagnostics::enabled();
+ 
+     while (auto packet = packets->pop()) {
+       if (shutdown_event->peek()) {
+@@ -2037,7 +2040,14 @@
+           session->audio.peer.port(),
+           session->localAddress,
+         };
+-        platf::send(send_info);
++        if (direct) {
++          const auto started = rpduo_audio_diagnostics::clock::now();
++          const auto sent = platf::send(send_info);
++          session->audio.send_timing.record("UDP data", started, std::chrono::milliseconds(session->config.audio.packetDuration),
++                                            {}, rpduo_audio_diagnostics::clock::now() - started, 0, !sent);
++        } else {
++          platf::send(send_info);
++        }
+ 
+         auto &fec_packet = session->audio.fec_packet;
+         // initialize the FEC header at the beginning of the FEC block
+diff --git a/src/platform/macos/microphone.mm b/src/platform/macos/microphone.mm
+--- a/src/platform/macos/microphone.mm
++++ b/src/platform/macos/microphone.mm
+@@ -47,10 +47,7 @@
+ 
+     ~relay_mic_t() override {
+       if (buffer.underruns || buffer.overruns || stale_packets || buffer.smoothed_frames || resyncs || peak_late >= 5ms) {
+-        BOOST_LOG(info) << "NX2Apple audio relay: underruns="sv << buffer.underruns
+-                        << ", overruns="sv << buffer.overruns << ", stale packets="sv << stale_packets
+-                        << ", smoothed frames="sv << buffer.smoothed_frames << ", resyncs="sv << resyncs
+-                        << ", max capture delay="sv << std::chrono::duration_cast<std::chrono::milliseconds>(peak_late).count() << " ms"sv;
++        report_counters("final", peak_late, peak_packet_age_ns);
+       }
+       if (socket_fd >= 0) {
+         close(socket_fd);
+@@ -113,6 +110,7 @@
+       } else {
+         const auto late = now - deadline;
+         peak_late = std::max(peak_late, late);
++        interval_late = std::max(interval_late, late);
+         // Keep the encoder cadence across short scheduling stalls. Moving the deadline to now
+         // after every stall would accumulate that lost playback time in the PCM queue.
+         if (late > 100ms) {
+@@ -128,10 +126,30 @@
+       receive_packets(discard_before);
+       std::this_thread::sleep_until(deadline);
+       buffer.read(output);
++      if (reported_audio && now >= next_report) {
++        report_counters("live", interval_late, interval_packet_age_ns);
++        next_report = now + 10s;
++        interval_late = {};
++        interval_packet_age_ns = 0;
++      }
+       return capture_e::ok;
+     }
+ 
+   private:
++    /**
++     * @brief Report cumulative PCM counts and gap maxima for the supplied interval.
++     * @param phase Distinguishes ongoing and final totals.
++     * @param late Longest capture deadline miss in the reported interval.
++     * @param age_ns Age of the oldest received input packet in that interval.
++     */
++    void report_counters(const char *phase, clock::duration late, std::uint64_t age_ns) const {
++      BOOST_LOG(info) << "NX2Apple audio relay ("sv << phase << "): underruns="sv << buffer.underruns
++                      << ", overruns="sv << buffer.overruns << ", stale packets="sv << stale_packets
++                      << ", smoothed frames="sv << buffer.smoothed_frames << ", resyncs="sv << resyncs
++                      << ", max capture delay us="sv << std::chrono::duration_cast<std::chrono::microseconds>(late).count()
++                      << ", max incoming packet age us="sv << age_ns / 1000;
++    }
++
+     /**
+      * @brief Drain available packets even if the encoder deadline has already passed.
+      * @param discard_before Drop datagrams older than this uptime after a long interruption.
+@@ -146,6 +164,11 @@
+         const auto size = recv(socket_fd, &received, sizeof received, MSG_DONTWAIT);
+         if (size == static_cast<ssize_t>(sizeof(packet_t))) {
+           const auto now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++          if (received.value.uptime_ns <= now_ns) {
++            const auto age_ns = now_ns - received.value.uptime_ns;
++            peak_packet_age_ns = std::max(peak_packet_age_ns, age_ns);
++            interval_packet_age_ns = std::max(interval_packet_age_ns, age_ns);
++          }
+           if (received.value.uptime_ns > now_ns || received.value.uptime_ns < discard_before ||
+               now_ns - received.value.uptime_ns > 120000000ull) {
+             ++stale_packets;
+@@ -155,6 +178,7 @@
+           const auto &samples = received.value.samples;
+           if (!reported_audio && std::any_of(samples.begin(), samples.end(), [](auto value) { return value != 0; })) {
+             reported_audio = true;
++            next_report = clock::now() + 10s;
+             BOOST_LOG(info) << "NX2Apple audio relay: received game audio"sv;
+           }
+           continue;
+@@ -185,6 +209,10 @@
+     std::uint64_t stale_packets {};  ///< Packets too far behind the host clock.
+     std::uint64_t resyncs {};  ///< Number of severe interruptions that reset playback.
+     clock::duration peak_late {};  ///< Longest interruption of the capture loop.
++    clock::duration interval_late {};  ///< Longest interruption in the current report window.
++    std::uint64_t peak_packet_age_ns {};  ///< Oldest received PCM packet over this session.
++    std::uint64_t interval_packet_age_ns {};  ///< Oldest received PCM packet in this report window.
++    clock::time_point next_report {};  ///< Deadline for the next live aggregate.
+     clock::time_point deadline {};  ///< Next negotiated delivery time.
+     bool reported_audio {};  ///< Whether we verified that the game sent nonzero PCM.
+   };
+diff --git a/src/rpduo_audio_diagnostics.h b/src/rpduo_audio_diagnostics.h
+new file mode 100644
+--- /dev/null
++++ b/src/rpduo_audio_diagnostics.h
+@@ -0,0 +1,83 @@
++/**
++ * @file src/rpduo_audio_diagnostics.h
++ * @brief Periodic timing counters for the direct game audio path.
++ */
++#pragma once
++
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++
++#include "logging.h"
++
++namespace rpduo_audio_diagnostics {
++  using clock = std::chrono::steady_clock;
++
++  /** @brief Whether the host is capturing audio from the direct game relay. */
++  inline bool enabled() {
++    const char *path = std::getenv("RPDUO_STREAM_AUDIO_SOCKET");
++    return path && *path;
++  }
++
++  /** @brief Aggregate timing and loss counts without logging individual packets. */
++  class window_t {
++  public:
++    /**
++     * @brief Record one stage of the audio stream and log each ten-second interval.
++     * @param stage Name of the stage producing this sample.
++     * @param arrival Start time of work on this audio packet.
++     * @param period Negotiated duration of the audio packet.
++     * @param wait Time elapsed between enqueue and the start of work.
++     * @param work Time elapsed while processing the packet.
++     * @param dropped Number of queued packets skipped before this packet.
++     * @param failed Whether the data packet failed to reach the socket.
++     */
++    void record(const char *stage, clock::time_point arrival, clock::duration period,
++                clock::duration wait = {}, clock::duration work = {}, std::uint64_t dropped = 0, bool failed = false) {
++      using namespace std::chrono_literals;
++      if (previous != clock::time_point {}) {
++        const auto gap = arrival - previous;
++        peak_gap = std::max(peak_gap, gap);
++        gaps += gap > period * 2;
++        bursts += gap < period / 2;
++      }
++      previous = arrival;
++      if (next_report == clock::time_point {}) {
++        next_report = arrival + 10s;
++      }
++      ++packets;
++      lost += dropped;
++      failures += failed;
++      peak_wait = std::max(peak_wait, wait);
++      peak_work = std::max(peak_work, work);
++      if (arrival >= next_report) {
++        BOOST_LOG(info) << "NX2Apple audio timing (" << stage << "): packets=" << packets
++                        << ", gaps >2 frames=" << gaps << ", bursts <1/2 frame=" << bursts
++                        << ", queue drops=" << lost << ", send failures=" << failures
++                        << ", max gap us=" << micros(peak_gap) << ", max queue wait us=" << micros(peak_wait)
++                        << ", max work us=" << micros(peak_work);
++        *this = {};
++        previous = arrival;
++        next_report = arrival + 10s;
++      }
++    }
++
++  private:
++    /** @brief Convert a host clock interval to microseconds for the log. */
++    static std::chrono::microseconds::rep micros(clock::duration interval) {
++      return std::chrono::duration_cast<std::chrono::microseconds>(interval).count();
++    }
++
++    clock::time_point previous {};  ///< Arrival time of the previous packet.
++    clock::time_point next_report {};  ///< Earliest time for the next aggregate.
++    clock::duration peak_gap {};  ///< Longest interruption between packets.
++    clock::duration peak_wait {};  ///< Longest measured queue wait.
++    clock::duration peak_work {};  ///< Longest operation on this stage.
++    std::uint64_t packets {};  ///< Packets observed in the report window.
++    std::uint64_t gaps {};  ///< Intervals exceeding twice the negotiated duration.
++    std::uint64_t bursts {};  ///< Intervals shorter than half the negotiated duration.
++    std::uint64_t lost {};  ///< Missing packets detected in queue arrival sequence.
++    std::uint64_t failures {};  ///< Failed data-packet sends.
++  };
++}  // namespace rpduo_audio_diagnostics

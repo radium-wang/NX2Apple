@@ -4,7 +4,7 @@ The launcher (see the [README](README.md)) runs the same scripts a terminal does
 
 ## Build an RP Duo direct streaming game with raw haptics
 
-Use the ordinary Mac build flow in NX2Apple with the bundled RP Duo engine. For a manual 1.4.0 build, apply `DirectProducer-v1.4.0.patch` and then `DirectHaptics-v1.4.0.patch` to the matching engine. Copy `rpduo_haptics_mac.h` into `dm/host/`. To maintain an existing legacy bundle, rebuild its `dmhost` for the exact game version and shader chain, then sign the bundle. [Patch order and build instructions](integrations/rp-duo-streaming/README.md#direct-game-video-on-macos)
+Use the ordinary Mac build flow in NX2Apple with the bundled RP Duo engine. This branch's `tools/try-local` and macOS packaging workflow bundle the variant for the matching 1.4.0 engine. For manual app assembly, run `integrations/rp-duo-streaming/bundle-mac-engine.sh` with the engine tree and the app's `Contents/Resources` directory. To maintain an existing legacy bundle, rebuild its `dmhost` for the exact game version and shader chain, then sign the bundle. [Patch order and build instructions](integrations/rp-duo-streaming/README.md#direct-game-video-on-macos)
 
 Run `strings` on the game's `Contents/MacOS/dmhost` and check for `DM_RP_DUO_RAW_HAPTICS`. With the corresponding Sunshine and Artemis builds, look for `player 1 uses RP Duo direct four-band stream` in the game log. Verify gamepad input, a weak effect, a short pulse, and vibration stopping. Playback uses the firmware's exposed actuator capabilities. [Protocol and verification fields](integrations/rp-duo-streaming/PROTOCOL.md)
 

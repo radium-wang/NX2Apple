@@ -354,6 +354,7 @@ jobs:
           # the bundled engine (own_compilers.py exit code 1). sign_engine_tree.sh signs only a Mach-O file without any signature and checks the rest.
           ditto "$RUNNER_TEMP/engine-tree" "$APP/Contents/Resources/engine"
           tools/sign_engine_tree.sh "$APP/Contents/Resources/engine" "$RUNNER_TEMP/engine-tree"
+          bash ../integrations/rp-duo-streaming/bundle-mac-engine.sh "$RUNNER_TEMP/engine-tree" "$APP/Contents/Resources"
           # The iPhone shell's Swift package: build_shell.sh links it by DM_SHELL_PACKAGE and the launcher passes this folder (the engine has
           # none since #214). The step runs in frontend/, the package is one level up. No .build or .swiftpm.
           rsync -a --exclude .build --exclude .swiftpm ../frontend-ios/ "$APP/Contents/Resources/frontend-ios/"

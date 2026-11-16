@@ -139,6 +139,7 @@ ditto "$tools_cache/res/python" "$app/Contents/Resources/python"
 python3 frontend/tools/nxbuild.py fetch "$app/Contents/Resources" "$work/nxbuild"   # the pinned experimental builder (#749), nothing without a digest
 ditto "$work/engine-tree" "$app/Contents/Resources/engine"
 frontend/tools/sign_engine_tree.sh "$app/Contents/Resources/engine" "$work/engine-tree"
+bash integrations/rp-duo-streaming/bundle-mac-engine.sh "$work/engine-tree" "$app/Contents/Resources"
 rsync -a --exclude .build --exclude .swiftpm frontend-ios/ "$app/Contents/Resources/frontend-ios/"
 rsync -a frontend/l10n/ "$app/Contents/Resources/l10n/"
 cat > "$app/Contents/Info.plist" <<PLIST
