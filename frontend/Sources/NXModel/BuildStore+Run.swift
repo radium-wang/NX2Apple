@@ -145,7 +145,12 @@ extension BuildStore {
                 return
             }
         }
-        let engine = EngineLayout.root(repo.path)   // the checkout's engine/ (#214)
+        let macApp = target == BuildTarget.mac
+        var engine = EngineLayout.root(repo.path)   // the checkout's engine/ (#214)
+        if macApp && !nxbRun {
+            do { engine = try EngineBundle.directMacBuildTree(for: engine) }
+            catch { fail(t("launch.direct.engineUnavailable")); return }
+        }
         // A game folder's files are not encrypted: the script ignores -k for it, and the launcher does not ask for the keys.
         var args = [engine + "/" + RepoLayout.buildScript, inputDir] + (folder != nil ? [] : ["-k", keysPath]) + ["--progress", "json"]
         if let selectedTitleID { args += ["--title-id", selectedTitleID] }
@@ -171,7 +176,6 @@ extension BuildStore {
         if folder == nil, !nxbRun, RepoLayout.supportsRomfsFrom(repo.path) {
             for image in RomFSArchive.reusableImages(root: outDir.isEmpty ? baseDir : outDir, key: tidHex) { args += ["--romfs-from", image] }
         }
-        let macApp = target == BuildTarget.mac
         let macOutput = macApp ? MacAppOutput(workDir: URL(fileURLWithPath: workDir), key: tidHex, titleID: gameTitleID, preferred: macAppPath) : nil
         oneGameIPAPath = ""
         if exportsOneGame {

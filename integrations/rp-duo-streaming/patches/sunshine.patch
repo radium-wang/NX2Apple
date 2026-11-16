@@ -1,0 +1,263 @@
+diff --git a/src/input.cpp b/src/input.cpp
+index 66c1a1f..82d0fb0 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -32,6 +32,9 @@ extern "C" {
+ #include "config.h"
+ #include "globals.h"
+ #include "input.h"
++#ifdef __APPLE__
++  #include "raw_haptics_ingress.h"
++#endif
+ #include "logging.h"
+ #include "platform/common.h"
+ #include "platform/virtualhid_input.h"
+@@ -294,6 +297,21 @@ namespace input {
+    * @brief Input emulation settings loaded from configuration.
+    */
+   struct input_t {
++#ifdef __APPLE__
++    /** @brief Local wire format for player-one controller snapshots on Apple Silicon. */
++    struct rp_pad_frame {
++      uint32_t magic = 0x31445052;  ///< RPD1.
++      uint16_t buttons {};  ///< Moonlight digital buttons.
++      uint8_t lt {}, rt {};  ///< Analog trigger positions.
++      int16_t lx {}, ly {}, rx {}, ry {};  ///< Signed axes, positive up.
++    };
++
++    static_assert(sizeof(rp_pad_frame) == 16);
++    std::mutex rp_pad_mutex;  ///< Serializes writes from input and control workers.
++    bool rp_pad_enabled = false;  ///< Set by negotiated session startup.
++    std::optional<rp_pad_frame> rp_pad_state;  ///< Last received player-one state.
++    std::chrono::steady_clock::time_point rp_pad_sent;  ///< Last local send attempt.
++#endif
+     /**
+      * @brief Enumerates supported shortkey options.
+      */
+@@ -1660,7 +1678,78 @@ namespace input {
+    * @param input Platform input backend that receives the event.
+    * @param packet Protocol packet being processed.
+    */
++  /// Send one local pad snapshot without blocking the stream.
++#ifdef __APPLE__
++  static std::atomic<input_t *> rp_pad_owner {};  ///< One stream controls the local game.
++
++  static void send_rp_pad(const input_t::rp_pad_frame &frame) {
++    const auto path = rpduo::haptics_ingress::default_path();
++    if (path.empty()) {
++      return;
++    }
++    sockaddr_un addr {};
++    addr.sun_family = AF_UNIX;
++    const auto pad_path = path.substr(0, path.rfind('/') + 1) + "pad.sock";
++    if (pad_path.size() >= sizeof(addr.sun_path)) {
++      return;
++    }
++    std::memcpy(addr.sun_path, pad_path.c_str(), pad_path.size() + 1);
++    const int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++    if (fd < 0) {
++      return;
++    }
++    if (fcntl(fd, F_SETFL, O_NONBLOCK) == 0) {
++      sendto(fd, &frame, sizeof(frame), 0, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
++    }
++    close(fd);
++  }
++#endif
++
++  void enable_rp_pad(const std::shared_ptr<input_t> &input, bool enabled) {
++#ifdef __APPLE__
++    std::lock_guard lock {input->rp_pad_mutex};
++    if (enabled) {
++      auto *expected = static_cast<input_t *>(nullptr);
++      enabled = rp_pad_owner.compare_exchange_strong(expected, input.get()) || expected == input.get();
++    } else if (input->rp_pad_enabled) {
++      send_rp_pad({});
++      auto *expected = input.get();
++      rp_pad_owner.compare_exchange_strong(expected, nullptr);
++    }
++    input->rp_pad_enabled = enabled;
++    input->rp_pad_state.reset();
++#endif
++  }
++
++  void refresh_rp_pad(const std::shared_ptr<input_t> &input) {
++#ifdef __APPLE__
++    std::lock_guard lock {input->rp_pad_mutex};
++    auto now = std::chrono::steady_clock::now();
++    if (input->rp_pad_enabled && input->rp_pad_state && now - input->rp_pad_sent >= std::chrono::milliseconds(75)) {
++      send_rp_pad(*input->rp_pad_state);
++      input->rp_pad_sent = now;
++    }
++#endif
++  }
++
+   void passthrough(std::shared_ptr<input_t> &input, PNV_MULTI_CONTROLLER_PACKET packet) {
++#ifdef __APPLE__
++    if (config::input.controller && config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE && packet->controllerNumber == 0) {
++      std::lock_guard lock {input->rp_pad_mutex};
++      if (input->rp_pad_enabled) {
++        input_t::rp_pad_frame frame;
++        if (packet->activeGamepadMask & 1) {
++          frame = {0x31445052, static_cast<uint16_t>(packet->buttonFlags), packet->leftTrigger, packet->rightTrigger, packet->leftStickX, packet->leftStickY, packet->rightStickX, packet->rightStickY};
++          input->rp_pad_state = frame;
++        } else {
++          input->rp_pad_state.reset();
++        }
++        send_rp_pad(frame);
++        input->rp_pad_sent = std::chrono::steady_clock::now();
++        return;
++      }
++    }
++#endif
+     if (!config::input.controller || config::input.gamepad_driver == config::GAMEPAD_DRIVER_NONE) {
+       return;
+     }
+diff --git a/src/input.h b/src/input.h
+index 41e0439..da84655 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -84,6 +84,11 @@ namespace input {
+    */
+   std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id);
+ 
++  /** @brief Enable direct RP Duo input for a negotiated session. */
++  void enable_rp_pad(const std::shared_ptr<input_t> &input, bool enabled);
++  /** @brief Renew the current controller snapshot while its streaming session is active. */
++  void refresh_rp_pad(const std::shared_ptr<input_t> &input);
++
+ #ifdef SUNSHINE_TESTS
+   namespace testing {
+     /**
+diff --git a/src/rtsp.cpp b/src/rtsp.cpp
+index 4532c2b..614f5f5 100644
+--- a/src/rtsp.cpp
++++ b/src/rtsp.cpp
+@@ -1082,6 +1082,7 @@ namespace rtsp_stream {
+     args.try_emplace("x-nv-vqos[0].fec.minRequiredFecPackets"sv, "0"sv);
+     args.try_emplace("x-nv-general.featureFlags"sv, "135"sv);
+     args.try_emplace("x-ml-general.featureFlags"sv, "0"sv);
++    args.try_emplace("x-rpduo-haptics.version"sv, "0"sv);
+     args.try_emplace("x-nv-vqos[0].qosTrafficType"sv, "5"sv);
+     args.try_emplace("x-nv-aqos.qosTrafficType"sv, "4"sv);
+     args.try_emplace("x-ml-video.configuredBitrateKbps"sv, "0"sv);
+@@ -1105,6 +1106,7 @@ namespace rtsp_stream {
+       config.controlProtocolType = (int) util::from_view(args.at("x-nv-general.useReliableUdp"sv));
+       config.packetsize = (int) util::from_view(args.at("x-nv-video[0].packetSize"sv));
+       config.minRequiredFecPackets = (int) util::from_view(args.at("x-nv-vqos[0].fec.minRequiredFecPackets"sv));
++      config.rpHapticsVersion = (int) util::from_view(args.at("x-rpduo-haptics.version"sv));
+       config.mlFeatureFlags = (int) util::from_view(args.at("x-ml-general.featureFlags"sv));
+       config.audioQosType = (int) util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
+       config.videoQosType = (int) util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
+diff --git a/src/stream.cpp b/src/stream.cpp
+index a222b40..464dba0 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -30,6 +30,9 @@
+ #include "platform/common.h"
+ #include "process.h"
+ #include "stream.h"
++#ifdef __APPLE__
++  #include "raw_haptics_ingress.h"
++#endif
+ #include "sync.h"
+ #include "system_tray.h"
+ #include "thread_safe.h"
+@@ -1148,6 +1151,31 @@ namespace stream {
+     return 0;
+   }
+ 
++#ifdef __APPLE__
++  /**
++   * @brief Send one unmodified raw snapshot only to explicitly opted-in clients.
++   * @param session Active paired streaming session.
++   * @param frame Validated, versioned raw motor state.
++   */
++  void send_raw_haptics(session_t *session, const std::array<unsigned char, RP_HAPTICS_SIZE> &frame) {
++    if (session->config.rpHapticsVersion != 1 || session->config.controlProtocolType != 13 || !(session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2) || !session->control.peer) {
++      return;
++    }
++
++    struct raw_message_t {
++      control_header_v2 header;  ///< Existing encrypted control framing.
++      std::array<unsigned char, RP_HAPTICS_SIZE> state;  ///< Original game snapshot.
++    } plaintext {};
++
++    plaintext.header.type = RP_HAPTICS_MESSAGE;
++    plaintext.header.payloadLength = RP_HAPTICS_SIZE;
++    plaintext.state = frame;
++    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size> encrypted;
++    auto payload = encode_control(session, util::view(plaintext), encrypted);
++    session->broadcast_ref->control_server.send(payload, session->control.peer);
++  }
++#endif
++
+   /**
+    * @brief Send the selected HDR mode to the connected client over the control channel.
+    *
+@@ -1338,7 +1366,14 @@ namespace stream {
+     // termination when we shut down.
+     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
++#ifdef __APPLE__
++    rpduo::haptics_ingress raw_ingress(rpduo::haptics_ingress::default_path());
++    BOOST_LOG(info) << "RP Duo raw haptics ingress: " << (raw_ingress.ready() ? "ready" : "unavailable");
++#endif
+     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
++#ifdef __APPLE__
++      auto raw_frames = raw_ingress.poll();
++#endif
+       bool has_session_awaiting_peer = false;
+ 
+       {
+@@ -1382,6 +1417,10 @@ namespace stream {
+           if (!session->control.peer) {
+             has_session_awaiting_peer = true;
+           } else {
++#ifdef __APPLE__
++            input::refresh_rp_pad(session->input);
++            for (const auto &raw_frame : raw_frames) send_raw_haptics(session, raw_frame);
++#endif
+             auto &feedback_queue = session->control.feedback_queue;
+             while (feedback_queue->peek()) {
+               auto feedback_msg = feedback_queue->pop();
+@@ -1407,7 +1446,10 @@ namespace stream {
+         break;
+       }
+ 
+-      server->iterate(150ms);
++      // Gamepad feedback is queued by another thread, so ENet receives no
++      // wakeup for it. A long wait can send a short effect's start and stop
++      // together, leaving the client with no time to play the effect.
++      server->iterate(8ms);
+     }
+ 
+     // Let all remaining connections know the server is shutting down
+@@ -2314,6 +2356,7 @@ namespace stream {
+       session.controlEnd.view();
+       // Reset input on session stop to avoid stuck repeated keys
+       BOOST_LOG(debug) << "Resetting Input..."sv;
++      input::enable_rp_pad(session.input, false);
+       input::reset(session.input);
+ 
+       // If this is the last session, invoke the platform callbacks
+@@ -2344,6 +2387,7 @@ namespace stream {
+      */
+     int start(session_t &session, const std::string &addr_string) {
+       session.input = input::alloc(session.mail, session.input_session_id);
++      input::enable_rp_pad(session.input, session.config.rpHapticsVersion == 1 && session.config.controlProtocolType == 13 && (session.config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2));
+ 
+       session.broadcast_ref = broadcast.ref();
+       if (!session.broadcast_ref) {
+diff --git a/src/stream.h b/src/stream.h
+index c0b0f96..66de7f9 100644
+--- a/src/stream.h
++++ b/src/stream.h
+@@ -31,6 +31,7 @@ namespace stream {
+ 
+     int packetsize;  ///< Maximum payload size for network packets.
+     int minRequiredFecPackets;  ///< Minimum recovery packets required before FEC is emitted.
++    int rpHapticsVersion {};  ///< Negotiated private RP Duo raw-haptics version.
+     int mlFeatureFlags;  ///< Moonlight feature flags negotiated for this session.
+     int controlProtocolType;  ///< GameStream control protocol variant selected by the client.
+     int audioQosType;  ///< Audio QoS type.

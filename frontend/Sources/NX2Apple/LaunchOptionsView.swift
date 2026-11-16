@@ -21,12 +21,14 @@ struct LaunchOptionsView: View {
     @State private var advancedOpen = false
     @State private var category: LaunchCategory = .game
     @State private var defaultsSaved = false   // Use for new games ran: the note says so until the sheet closes
+    @State private var prepareDirectOnDone = false
     @State private var askingTested = false   // Use tested values asks first (#453)
     /// Build this game…: the launcher closes the sheet and opens the Builds page with this game's form (nil in a test).
     var onBuild: (LibraryGame) -> Void = { _ in }
     /// The cheats and the saves have sheets of their own: the launcher closes this one and opens them (nil: the row does nothing).
     var openCheats: ((UUID) -> Void)? = nil
     var openSaves: ((UUID) -> Void)? = nil
+    var openDirect: ((UUID) -> Void)? = nil
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var choicesRevision = 0   // bumped by a change: the values are read from the store again
     @State private var modsRevision = 0   // bumped by Refresh: the folder is read again
@@ -43,6 +45,7 @@ struct LaunchOptionsView: View {
     /// A saved choice for a row of the list, else the tested default; what only this launcher has comes from the library.
     private func value(_ s: LaunchSetting, _ game: LibraryGame) -> String {
         _ = choicesRevision
+        if s.env == "DM_FULLSCREEN", DirectStream.selected(game) { return DirectStream.displayValue }
         return s.storeBacked ? (store?.current(s) ?? s.def) : game.launchValue(s)
     }
     private var modsFolder: URL? { game.map { GameMod.folder(for: $0, library: library.folder) } }
@@ -247,12 +250,12 @@ struct LaunchOptionsView: View {
                             .padTarget("opt.useForNew", scope: "launch") { useForNewGames(game, settings) }
                     }
                 }
-                Button { dismiss() } label: {
+                Button { finish() } label: {
                     Text(loc.t("launch.done")).font(.manrope(13.5, .bold))
                         .padding(.horizontal, 22).padding(.vertical, 9)
                 }
                 .buttonStyle(LauncherActionButtonStyle()).keyboardShortcut(.defaultAction)
-                .padTarget("opt.done", scope: "launch", radius: 20) { dismiss() }
+                .padTarget("opt.done", scope: "launch", radius: 20) { finish() }
             }
         }
         .padding(.horizontal, 30).padding(.vertical, 16)
@@ -266,7 +269,8 @@ struct LaunchOptionsView: View {
             let current = value(s, game)
             switch s.env {
             case "DM_LANG": personal.set(current, for: "DM_LANG")
-            case "DM_FULLSCREEN": personal.set(current == "1" ? "1" : "", for: "DM_FULLSCREEN")
+            case "DM_FULLSCREEN" where current != DirectStream.displayValue:
+                personal.set(current == "1" ? "1" : "", for: "DM_FULLSCREEN")
             case "DM_RUMBLE": personal.set(current == s.offValue ? "0" : "", for: "DM_RUMBLE")
             default: break
             }
@@ -342,8 +346,18 @@ struct LaunchOptionsView: View {
     private func note(_ s: LaunchSetting) -> String { s.note.isEmpty ? "" : text("launch.set." + s.env + ".note", s.note) }
 
     private func set(_ s: LaunchSetting, _ value: String) {
+        if s.env == "DM_FULLSCREEN" {
+            prepareDirectOnDone = value == DirectStream.displayValue
+            library.setDirectDisplay(prepareDirectOnDone, for: gameID)
+            if prepareDirectOnDone { choicesRevision += 1; return }
+        }
         if s.storeBacked { store?.set(s, value) } else { library.setLaunchOption(s, value, for: gameID) }
         choicesRevision += 1
+    }
+
+    private func finish() {
+        dismiss()
+        if prepareDirectOnDone { openDirect?(gameID) }
     }
 
     /// The settings whose value differs from the game profile's tested default, hidden sub-settings included: what Use tested values
@@ -357,6 +371,7 @@ struct LaunchOptionsView: View {
         store?.reset(settings)
         library.resetLaunchOptions(for: gameID)
         choicesRevision += 1
+        prepareDirectOnDone = false
     }
 
     /// Docked unless the console mode chosen is handheld (DM_OPMODE 0), for the render scale's pixels.

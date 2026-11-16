@@ -105,6 +105,26 @@ extension LauncherView {
         }
     }
 
+    private func prepareDirectGame(_ game: LibraryGame, environment: [String: String]) {
+        let generation = launchHintGeneration
+        let app = game.appPath
+        Task { @MainActor in
+            let result = await Task.detached { () -> Result<Void, Error> in
+                do { try await DirectStream.prepare(app: app, environment: environment); return .success(()) }
+                catch { return .failure(error) }
+            }.value
+            guard launchHintGeneration == generation else { return }
+            endGameLaunch()
+            switch result {
+            case .success: directLaunchReady = true
+            case .failure(DirectStream.Failure.unsupported):
+                launchError = loc.t("launch.direct.rebuild")
+            case .failure:
+                launchError = loc.t("launch.direct.unavailable")
+            }
+        }
+    }
+
     private func startMacGame(_ game: LibraryGame, cloudChoice: [String: String]) {
         let currentGame = library.games.first(where: { $0.id == game.id }) ?? game
         let configuration = NSWorkspace.OpenConfiguration()
@@ -122,6 +142,10 @@ extension LauncherView {
         let withRecording = environment
             .merging(FrameTimes.recordingEnvironment(for: currentGame, library: library.folder)) { $1 }
             .merging(cloudChoice) { $1 }
+        if DirectStream.selected(currentGame) {
+            prepareDirectGame(currentGame, environment: withRecording)
+            return
+        }
         if !withRecording.isEmpty { configuration.environment = withRecording }
         let generation = launchHintGeneration
         MacGameMode.shared.prepareForLaunch(enabled: currentGame.macGameModeDesired, forApp: currentGame.appPath) { error in

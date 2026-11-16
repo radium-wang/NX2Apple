@@ -1,0 +1,116 @@
+diff --git a/dm/host/front_mac.m b/dm/host/front_mac.m
+index aae7512..5526ef2 100644
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -1,5 +1,5 @@
+ // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
+-// Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
++// DM_STREAM_RELAY runs AppKit and controllers without a window. When neither option is set, the guest runs directly on the current thread (windowless tests use this).
+ // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN=1 starts it that way. ⌘Q quits, and so does a controller's Home button held for 2 s and
+ // confirmed with A (home_quit.h); the left mouse button is the touchscreen.
+ // Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
+@@ -74,6 +74,7 @@ static void rpduo_pad_start(NSWindow *window) {
+ #include <sys/stat.h>
+ 
+ static CAMetalLayer *g_layer;
++static bool g_stream_relay;
+ static uint64_t g_btn;
+ static key_state g_key_state;
+ static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
+@@ -83,6 +84,7 @@ static void rpduo_pad_start(NSWindow *window) {
+ int front_screen_max_fps(void) { return g_screen_fps; }
+ static _Atomic CGDirectDisplayID g_screen_id;   // the window's screen (screen_refresh); 0 until the window is up, then the main display stands in
+ int front_display_pixels(int *w, int *h) {
++    if (g_stream_relay) return 0;   // The guest uses the 1080p fallback for an independent relay.
+     CGDirectDisplayID id = g_screen_id; CGDisplayModeRef m = CGDisplayCopyDisplayMode(id ? id : CGMainDisplayID()); if (!m) return 0;
+     int a = (int)CGDisplayModeGetPixelWidth(m), b = (int)CGDisplayModeGetPixelHeight(m); CGDisplayModeRelease(m);
+     if (a <= 0 || b <= 0) return 0;
+@@ -405,6 +407,19 @@ - (void)windowDidFailToEnterFullScreen:(NSWindow *)w { (void)w; if (g_fs_failed)
+     ((guest_arg *)p)->fn(); LOG("guest thread finished"); exit(0);
+ }
+ 
++static void run_guest_with_appkit(void (*guest)(void)) {
++    // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty).
++    static guest_arg ga;
++    ga.fn = guest;
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 64u << 20);
++    pthread_t thread;
++    if (pthread_create(&thread, &attr, guest_tramp, &ga)) die("pthread_create guest");
++    pthread_attr_destroy(&attr);
++    [NSApp run];
++}
++
+ // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
+ __attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
+ 
+@@ -1256,9 +1271,21 @@ - (BOOL)windowShouldClose:(NSWindow *)w {
+ void front_run(void (*guest)(void)) {
+     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
+     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
+-    if (!getenv("DM_WINDOW")) { guest(); return; }
++    const char *relay = getenv("DM_STREAM_RELAY");
++    g_stream_relay = relay && *relay;
++    if (!g_stream_relay && !getenv("DM_WINDOW")) { guest(); return; }
+     @autoreleasepool {
+         [NSApplication sharedApplication];
++        if (g_stream_relay) {
++            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++            GCController.shouldMonitorBackgroundEvents = YES;
++            dm_haptics_apple_init();
++            front_controllers_start();
++            dm_focus_set(1);
++            LOG("front end: windowless stream relay, system controllers enabled");
++            run_guest_with_appkit(guest);
++            return;
++        }
+         // DM_CURSOR_HIDDEN=1 (see the pointer below) hides it here, before the app takes the front: a hide after the window left the pointer up until it ran. The
+         // launcher's console also yields the front to the game rather than let LaunchServices activate it when it registers, which shows the pointer whatever the app
+         // hid (issue #380)
+@@ -1410,11 +1437,7 @@ void front_run(void (*guest)(void)) {
+         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
+         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
+         display_awake(win.isKeyWindow);   // the window may have become key (makeKeyAndOrderFront above) before these observers were installed
+-        // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
+-        static guest_arg ga; ga.fn = guest;
+-        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
+-        pthread_t th; if (pthread_create(&th, &a, guest_tramp, &ga)) die("pthread_create guest");
+-        [NSApp run];
++        run_guest_with_appkit(guest);
+     }
+ }
+ 
+diff --git a/dm/host/controllers_mac.m b/dm/host/controllers_mac.m
+index 6de66e3..c4d6c5c 100644
+--- a/dm/host/controllers_mac.m
++++ b/dm/host/controllers_mac.m
+@@ -1025,6 +1025,9 @@ void front_controllers_start(void) {
+     hidpad_start();
+     dm_motion_pro_start(controller_pro_changed);
+     dm_motion_pro_active(g_focus);
+-    for(NSNotificationName name in @[NSApplicationDidResignActiveNotification,NSApplicationDidBecomeActiveNotification])
+-        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { front_controllers_focus([n.name isEqual:NSApplicationDidBecomeActiveNotification]); }];
++    // The windowless relay opts into background controller events for its lifetime.
++    if (!GCController.shouldMonitorBackgroundEvents) {
++        for(NSNotificationName name in @[NSApplicationDidResignActiveNotification,NSApplicationDidBecomeActiveNotification])
++            [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { front_controllers_focus([n.name isEqual:NSApplicationDidBecomeActiveNotification]); }];
++    }
+ }
+diff --git a/dm/host/haptics_apple.m b/dm/host/haptics_apple.m
+index 3944298..7aa6b1d 100644
+--- a/dm/host/haptics_apple.m
++++ b/dm/host/haptics_apple.m
+@@ -543,8 +543,10 @@ void dm_haptics_apple_init(void) {
+             (void)n; dm_haptics_clear(0);
+         }];
+ #else
+-        [nc addObserverForName:NSApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, YES); }];
+-        [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, NO); }];
++        if (!GCController.shouldMonitorBackgroundEvents) {
++            [nc addObserverForName:NSApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, YES); }];
++            [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, NO); }];
++        }
+         [nc addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_haptics_apple_shutdown(); }];
+ #endif
+         atexit(dm_haptics_apple_shutdown);

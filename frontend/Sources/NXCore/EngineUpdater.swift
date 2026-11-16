@@ -103,6 +103,18 @@ package enum EngineBundle {
               let id = EngineStore.identity(of: dir), EngineStore.isComplete(dir, id: id) else { return nil }
         return dir
     }
+
+    /// The direct Mac variant is built from one exact engine release. Other selected engines keep their own build pipeline.
+    package static func directMacBuildTree(for engine: String, resources: URL? = Bundle.main.resourceURL,
+                                           store: EngineStore = EngineStore()) throws -> String {
+        let selected = URL(fileURLWithPath: engine, isDirectory: true)
+        guard let selectedID = EngineStore.identity(of: selected),
+              let variant = resources?.appendingPathComponent("rpduo-engine", isDirectory: true),
+              let base = try? String(contentsOf: variant.appendingPathComponent(".rpduo-base-engine-id"), encoding: .utf8),
+              base.trimmingCharacters(in: .whitespacesAndNewlines) == selectedID,
+              let id = EngineStore.identity(of: variant) else { return engine }
+        return try EngineInstaller.seed(from: variant, engineID: id, store: store).path
+    }
 }
 
 /// Installing an engine tree into the store. Every tree is unpacked or copied into a hidden folder beside the others

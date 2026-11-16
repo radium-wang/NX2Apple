@@ -1,0 +1,192 @@
+diff --git a/src/platform/macos/microphone.mm b/src/platform/macos/microphone.mm
+index 72776e7..64145e6 100644
+--- a/src/platform/macos/microphone.mm
++++ b/src/platform/macos/microphone.mm
+@@ -2,6 +2,27 @@
+  * @file src/platform/macos/microphone.mm
+  * @brief Definitions for microphone capture on macOS.
+  */
++// standard includes
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <utility>
++
++// platform includes
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
+ // local includes
+ #include "src/config.h"
+ #include "src/logging.h"
+@@ -11,6 +32,142 @@
+ namespace platf {
+   using namespace std::literals;
+ 
++  /**
++   * @brief Consume 5 ms stereo PCM datagrams from the NX2Apple game directly.
++   */
++  struct relay_mic_t final: public mic_t {
++    /** @brief One 5 ms block of interleaved stereo PCM16 with its host timestamp. */
++    struct packet_t {
++      std::uint64_t uptime_ns;  ///< Clock shared with the producer.
++      std::array<std::int16_t, 480> samples;  ///< 240 frames at 48 kHz.
++    };
++    static_assert(sizeof(packet_t) == 968);
++    using clock = std::chrono::steady_clock;
++
++    ~relay_mic_t() override {
++      if (socket_fd >= 0) {
++        close(socket_fd);
++      }
++      struct stat current {};
++      if (socket_file.st_ino && lstat(path.c_str(), &current) == 0 &&
++          current.st_dev == socket_file.st_dev && current.st_ino == socket_file.st_ino) {
++        unlink(path.c_str());
++      }
++    }
++
++    /**
++     * @brief Open a private local audio socket with no microphone or system audio access.
++     * @param socket_path Absolute path to a new socket in an owned private directory.
++     * @return Whether the endpoint was opened.
++     */
++    bool open_socket(std::string socket_path) {
++      sockaddr_un address {};
++      const auto slash = socket_path.rfind('/');
++      if (slash == 0 || slash == std::string::npos || socket_path[0] != '/' ||
++          slash + 1 == socket_path.size() || socket_path.size() >= sizeof address.sun_path) {
++        return false;
++      }
++
++      const auto directory = socket_path.substr(0, slash);
++      struct stat owner {};
++      if (lstat(directory.c_str(), &owner) != 0 || !S_ISDIR(owner.st_mode) ||
++          owner.st_uid != geteuid() || (owner.st_mode & 0077)) {
++        return false;
++      }
++
++      socket_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++      if (socket_fd < 0 || fcntl(socket_fd, F_SETFD, FD_CLOEXEC) != 0 ||
++          fcntl(socket_fd, F_SETFL, O_NONBLOCK) != 0) {
++        return false;
++      }
++      address.sun_family = AF_UNIX;
++      std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
++      address.sun_len = SUN_LEN(&address);
++      if (bind(socket_fd, reinterpret_cast<const sockaddr *>(&address), address.sun_len) != 0) {
++        return false;
++      }
++      path = std::move(socket_path);
++      return lstat(path.c_str(), &socket_file) == 0;
++    }
++
++    /**
++     * @brief Feed the Opus encoder at its negotiated cadence, substituting silence for missing blocks.
++     * @param output Interleaved stereo float samples for one encoder frame.
++     * @return Audio capture status.
++     */
++    capture_e sample(std::vector<float> &output) override {
++      const auto now = clock::now();
++      if (now - deadline > 20ms) {
++        deadline = now;
++        offset = packet.samples.size();
++      }
++      deadline += std::chrono::nanoseconds(output.size() * 1000000000ull / 96000);
++
++      auto dst = output.begin();
++      while (dst != output.end()) {
++        if (offset == packet.samples.size() && !read_packet()) {
++          std::fill(dst, output.end(), 0.0f);
++          break;
++        }
++        const auto count = std::min(packet.samples.size() - offset,
++                                    static_cast<std::size_t>(output.end() - dst));
++        std::transform(packet.samples.begin() + offset, packet.samples.begin() + offset + count,
++                       dst, [](std::int16_t value) { return value / 32768.0f; });
++        offset += count;
++        dst += count;
++      }
++      std::this_thread::sleep_until(deadline);
++      return capture_e::ok;
++    }
++
++  private:
++    /** @brief Wait to the current audio deadline for one fresh, complete packet. */
++    bool read_packet() {
++      while (clock::now() < deadline) {
++        // A larger receive buffer lets us recognize and reject truncated datagrams.
++        struct {
++          packet_t value;
++          std::uint8_t guard;
++        } received {};
++        const auto size = recv(socket_fd, &received, sizeof received, MSG_DONTWAIT);
++        if (size == static_cast<ssize_t>(sizeof(packet_t))) {
++          const auto now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++          if (received.value.uptime_ns > now_ns || now_ns - received.value.uptime_ns > 25000000ull) {
++            continue;
++          }
++          packet = received.value;
++          offset = 0;
++          if (!reported_audio && std::any_of(packet.samples.begin(), packet.samples.end(), [](auto value) { return value != 0; })) {
++            reported_audio = true;
++            BOOST_LOG(info) << "NX2Apple audio relay: received game audio"sv;
++          }
++          return true;
++        }
++        if (size >= 0 || errno == EINTR) {
++          continue;
++        }
++        if (errno != EAGAIN && errno != EWOULDBLOCK) {
++          return false;
++        }
++
++        pollfd pending {socket_fd, POLLIN, 0};
++        auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - clock::now()).count();
++        if (remaining <= 0 || (poll(&pending, 1, static_cast<int>(remaining)) < 0 && errno != EINTR)) {
++          return false;
++        }
++      }
++      return false;
++    }
++
++    int socket_fd {-1};  ///< Bound PCM endpoint.
++    std::string path;  ///< Filesystem name used to remove the endpoint.
++    struct stat socket_file {};  ///< Identity of this stream's own endpoint.
++    packet_t packet {};  ///< Last received block.
++    std::size_t offset {packet.samples.size()};  ///< First unconsumed stereo sample.
++    clock::time_point deadline {};  ///< Next negotiated delivery time.
++    bool reported_audio {};  ///< Whether we verified that the game sent nonzero PCM.
++  };
++
+   /**
+    * @brief macOS microphone capture device and audio format state.
+    */
+@@ -93,6 +250,16 @@ int set_sink(const std::string &sink) override {
+      * @return Microphone capture object for the requested audio layout.
+      */
+     std::unique_ptr<mic_t> microphone(const std::uint8_t *mapping, int channels, std::uint32_t sample_rate, std::uint32_t frame_size, bool continuous_audio, bool host_audio_enabled) override {
++      if (const char *socket_path = std::getenv("RPDUO_STREAM_AUDIO_SOCKET"); socket_path && *socket_path) {
++        auto relay = std::make_unique<relay_mic_t>();
++        if (channels != 2 || sample_rate != 48000 || !relay->open_socket(socket_path)) {
++          BOOST_LOG(error) << "NX2Apple audio relay requires stereo 48 kHz and a new socket in a private directory"sv;
++          return nullptr;
++        }
++        BOOST_LOG(info) << "NX2Apple audio relay: awaiting game audio"sv;
++        return relay;
++      }
++
+       auto mic = std::make_unique<av_mic_t>();
+       mic->av_audio_capture = [[AVAudio alloc] init];
+ 

@@ -1,0 +1,455 @@
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -14,6 +14,11 @@
+ #include <sys/sysctl.h>
+ #include <fcntl.h>
+ #include <TargetConditionals.h>
++#if TARGET_OS_OSX
++#import <CoreVideo/CoreVideo.h>
++#import <IOSurface/IOSurface.h>
++#include <xpc/xpc.h>
++#endif
+ #include <os/os_sync_wait_on_address.h>   // the uniform copy hand-off (nvn_rec.h ubc_wait)
+ #if TARGET_OS_IPHONE
+ #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+@@ -16421,29 +16426,142 @@
+     m4_end(en);
+     return up ? PRESENT_METALFX : PRESENT_STANDARD;
+ }
+-// The present's picture drawn into an offscreen texture (out: private, render target) the way present_now draws it into the drawable, MetalFX included, on the Metal 4 queue;
++// The present's picture drawn into an offscreen render target the way present_now draws it into the drawable, MetalFX included, on the Metal 4 queue;
+ // returns whether it was submitted. Completion reports the encoding kind, or PRESENT_FAILED on a GPU error. Resources remain resident and retained until GPU completion.
+-static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
++// cached_fx may be reused only when the caller keeps one render in flight.
++static int present_offscreen_m4_cached(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, fx_state *cached_fx, void (^done)(int)) {
+     id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
+     id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+     if (!al || !cb || !uvb) { MLOG("[RED] offscreen present: no command allocator or buffer"); return 0; }
+     id<MTLTexture> raw = present_raw_src(src);
+-    fx_state fx = {0};
++    fx_state temporary_fx = {0};
++    fx_state *fx = cached_fx ? cached_fx : &temporary_fx;
+     res_add(out); res_add(uvb); res_commit();
+     [cb beginCommandBufferWithAllocator:al];
+-    int kind = present_encode_m4(cb, raw, out, crop, uvb, &fx);
++    int kind = present_encode_m4(cb, raw, out, crop, uvb, fx);
+     [cb endCommandBuffer];
+-    if (!kind) { res_remove(out); res_remove(uvb); res_remove(fx.in); res_remove(fx.out); return 0; }
++    if (!kind) { res_remove(out); res_remove(uvb); res_remove(temporary_fx.in); res_remove(temporary_fx.out); return 0; }
+     MTL4CommitOptions *options = [MTL4CommitOptions new];
+     [options addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+-        (void)al; (void)cb; (void)raw; (void)fx.sc;   // keep the Metal 4 commands, source view and scaler alive too
+-        res_remove(out); res_remove(uvb); res_remove(fx.in); res_remove(fx.out);
++        (void)al; (void)cb; (void)raw; (void)temporary_fx.sc;   // keep the Metal 4 commands, source view and scaler alive too
++        res_remove(out); res_remove(uvb); res_remove(temporary_fx.in); res_remove(temporary_fx.out);
+         if (f.error) { MLOG("[RED] offscreen present: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "offscreen present"); }
+         done(f.error ? PRESENT_FAILED : kind);
+     }];
+     [g_q4 commit:&cb count:1 options:options];
+     return 1;
++}
++static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
++    return present_offscreen_m4_cached(src, crop, out, NULL, done);
++}
++#if TARGET_OS_OSX
++enum { RELAY_WIDTH = 1920, RELAY_HEIGHT = 1080, RELAY_POOL_LIMIT = 3 };
++static CVPixelBufferPoolRef g_relay_pool;
++static NSDictionary *g_relay_pool_limits;
++static xpc_connection_t g_relay_connection;
++static dispatch_queue_t g_relay_queue;
++static const char *g_relay_service;
++static _Atomic bool g_relay_busy;
++static uint64_t g_relay_sequence;
++static fx_state g_relay_fx;
++
++static void relay_read_options(void) {
++    const char *service = getenv("DM_STREAM_RELAY");
++    if (service && *service) g_relay_service = service;
+ }
++
++static bool relay_enabled(void) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, relay_read_options);
++    return g_relay_service != NULL;
++}
++
++static void relay_start(void) {
++    NSDictionary *attributes = @{
++        (id)kCVPixelBufferWidthKey: @(RELAY_WIDTH),
++        (id)kCVPixelBufferHeightKey: @(RELAY_HEIGHT),
++        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
++        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
++        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
++    };
++    CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
++        (__bridge CFDictionaryRef)attributes, &g_relay_pool);
++    if (status != kCVReturnSuccess) {
++        MLOG("stream relay: could not create pixel buffer pool (%d)", status);
++        return;
++    }
++    g_relay_pool_limits = @{ (id)kCVPixelBufferPoolAllocationThresholdKey: @(RELAY_POOL_LIMIT) };
++    g_relay_queue = dispatch_queue_create("org.nx2apple.stream-relay", DISPATCH_QUEUE_SERIAL);
++    g_relay_connection = xpc_connection_create_mach_service(g_relay_service, g_relay_queue, 0);
++    if (!g_relay_connection) {
++        MLOG("stream relay: could not create connection to %s", g_relay_service);
++        return;
++    }
++    xpc_connection_set_event_handler(g_relay_connection, ^(xpc_object_t event) {
++        if (event == XPC_ERROR_CONNECTION_INVALID) MLOG("stream relay: connection invalid (%s)", g_relay_service);
++    });
++    xpc_connection_resume(g_relay_connection);
++    MLOG("stream relay: sending %dx%d BGRA frames to %s", RELAY_WIDTH, RELAY_HEIGHT, g_relay_service);
++}
++
++static void relay_release_frame(CVPixelBufferRef buffer) {
++    if (buffer) CVPixelBufferRelease(buffer);
++    atomic_store(&g_relay_busy, false);
++}
++
++static void relay_present(id<MTLTexture> src, const int crop[4]) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, relay_start);
++    if (!g_relay_connection || atomic_exchange(&g_relay_busy, true)) return;
++
++    CVPixelBufferRef buffer = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault,
++        g_relay_pool, (__bridge CFDictionaryRef)g_relay_pool_limits, &buffer);
++    if (status != kCVReturnSuccess) {
++        if (status != kCVReturnWouldExceedAllocationThreshold)
++            MLOG("stream relay: could not allocate pixel buffer (%d)", status);
++        relay_release_frame(buffer);
++        return;
++    }
++
++    IOSurfaceRef surface = CVPixelBufferGetIOSurface(buffer);
++    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++        width:RELAY_WIDTH height:RELAY_HEIGHT mipmapped:NO];
++    desc.storageMode = MTLStorageModeShared;
++    desc.usage = MTLTextureUsageRenderTarget;
++    id<MTLTexture> dst = surface ? [g_dev newTextureWithDescriptor:desc iosurface:surface plane:0] : nil;
++    if (!dst) {
++        MLOG("stream relay: could not create Metal texture from IOSurface");
++        relay_release_frame(buffer);
++        return;
++    }
++    uint64_t seq = ++g_relay_sequence;
++    if (!present_offscreen_m4_cached(src, crop, dst, &g_relay_fx, ^(int kind) {
++        if (kind == PRESENT_FAILED) {
++            relay_release_frame(buffer);
++            return;
++        }
++        uint64_t ready_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        xpc_object_t description = IOSurfaceCreateXPCObject(surface);
++        if (!description) {
++            relay_release_frame(buffer);
++            return;
++        }
++        xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
++        xpc_dictionary_set_string(message, "op", "frame");
++        xpc_dictionary_set_value(message, "surface", description);
++        xpc_dictionary_set_uint64(message, "seq", seq);
++        xpc_dictionary_set_uint64(message, "ts_ns", ready_ns);
++        // The receiver replies after its last read. Until then the pool must not reuse the bytes.
++        IOSurfaceIncrementUseCount(surface);
++        xpc_connection_send_message_with_reply(g_relay_connection, message, g_relay_queue, ^(xpc_object_t reply) {
++            (void)reply;
++            IOSurfaceDecrementUseCount(surface);
++            relay_release_frame(buffer);
++        });
++    })) relay_release_frame(buffer);
++}
++#endif
+ // Diagnostic readback and tests wait for the same asynchronous capture used by whole-window screenshots. A timeout leaves cleanup with the GPU completion handler.
+ static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLTexture> out) {
+     dispatch_semaphore_t sem = dispatch_semaphore_create(0); __block int kind = PRESENT_FAILED;
+@@ -16520,6 +16638,12 @@
+     pthread_mutex_unlock(&g_shotq_mu);
+ 
+     if (atomic_load(&g_gpu_lost)) return 0;   // the display command buffer would be ignored too: take no drawable from the screen the front end is about to close
++#if TARGET_OS_OSX
++    if (relay_enabled()) {
++        relay_present(src, crop);
++        return 0;   // The relay copy has been submitted or dropped; the present queue can release this frame.
++    }
++#endif
+     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
+     if (!layer) return 0;
+     if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
+@@ -16745,6 +16869,9 @@
+     return NULL;
+ }
+ static void link_sync(void) {   // Called every frame by the game's present thread: aligns the display link object's state to g_dm_present_link and the power-saving mode (can change at run time)
++#if TARGET_OS_OSX
++    if (relay_enabled()) return;   // The relay consumes the game's present queue independently of any display.
++#endif
+     static int applied;
+     pthread_mutex_lock(&g_pq_mu);
+     int want = g_dm_present_link;
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -22,7 +22,7 @@
+ 	$(MAKE) -C ../../host host_msl GAME=$(GAME)
+ .PHONY: host_msl_force
+ host_msl_force:
+-FW=-framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
++FW=-framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreVideo -framework IOSurface -framework UniformTypeIdentifiers
+ # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
+ # Tests that #include nvn_mtl.m link the rest of the NVN layer beside it (hle_nvn.c: memory pools, sparse pools, serials) and the host's large stack, with weak stubs of what they need of the host (t_host_stubs.c)
+ MTL_T_DEP=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -83,7 +83,7 @@
+ FORCE:
+ # Makefile: a change to CFLAGS (or the compile line) rebuilds the host
+ dmhost: Makefile $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h romfs_image.h save_sync.h dm_input.h input_map.h input_preferences_mac.h pad_slots.h pad_map.h pad_motion.h steam_input.h controllers_mac.h hle_haptics.h haptics_apple.h pad_switch2_apple.h switch2_proto.h motion_fusion.h motion_apple.h motion_pro.h motion_pro_mac.h pad_joycon.h pad_joycon_mac.h pad_apple.h pad_hid.h pad_hid_mac.h home_quit.h home_quit_mac.h ctrl_prompt.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB) $(DAV1D_LIB) $(MSL_H)
+-	clang $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) $(DAV1D_LIB) -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
++	clang $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) $(DAV1D_LIB) -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework ImageIO -framework UniformTypeIdentifiers
+ clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx and dav1d builds; dmhost_* and *.dSYM beside them, as in .gitignore)
+ 	rm -rf gen dmhost dmhost_* *.dSYM
+ .PHONY: clean
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -1,5 +1,5 @@
+ // Mac front end: with DM_WINDOW=1 open a window (CAMetalLayer, for the graphics backend to present frames) + keyboard and controllers → dm_input; the guest runs on a large-stack thread instead and the main thread belongs to AppKit.
+-// Without DM_WINDOW: the guest runs directly on the current thread, behaving the same as with no front end (windowless tests use this).
++// DM_STREAM_RELAY runs AppKit and controllers without a window. When neither option is set, the guest runs directly on the current thread (windowless tests use this).
+ // The window is fullscreen-capable (the green button and ⌃⌘F); DM_FULLSCREEN=1 starts it that way. ⌘Q quits, and so does a controller's Home button held for 2 s and
+ // confirmed with A (home_quit.h); a short press opens the Home menu (Resume, Back to console mode, Quit); the left mouse button is the touchscreen.
+ // Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
+@@ -29,6 +29,7 @@
+ #include <sys/stat.h>
+ 
+ static CAMetalLayer *g_layer;
++static bool g_stream_relay;
+ static uint64_t g_btn;
+ static key_state g_key_state;
+ static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
+@@ -38,6 +39,7 @@
+ int front_screen_max_fps(void) { return g_screen_fps; }
+ static _Atomic CGDirectDisplayID g_screen_id;   // the window's screen (screen_refresh); 0 until the window is up, then the main display stands in
+ int front_display_pixels(int *w, int *h) {
++    if (g_stream_relay) return 0;   // The guest uses the 1080p fallback for an independent relay.
+     CGDirectDisplayID id = g_screen_id; CGDisplayModeRef m = CGDisplayCopyDisplayMode(id ? id : CGMainDisplayID()); if (!m) return 0;
+     int a = (int)CGDisplayModeGetPixelWidth(m), b = (int)CGDisplayModeGetPixelHeight(m); CGDisplayModeRelease(m);
+     if (a <= 0 || b <= 0) return 0;
+@@ -549,6 +551,19 @@
+     static char alt[65536];                       // The signal alternate stack is per thread; crash printing must also work on the guest thread
+     stack_t ss = {.ss_sp = alt, .ss_size = sizeof alt}; sigaltstack(&ss, 0);
+     ((guest_arg *)p)->fn(); LOG("guest thread finished"); exit(0);
++}
++
++static void run_guest_with_appkit(void (*guest)(void)) {
++    // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty).
++    static guest_arg ga;
++    ga.fn = guest;
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, 64u << 20);
++    pthread_t thread;
++    if (pthread_create(&thread, &attr, guest_tramp, &ga)) die("pthread_create guest");
++    pthread_attr_destroy(&attr);
++    [NSApp run];
+ }
+ 
+ // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
+@@ -1402,9 +1417,21 @@
+ void front_run(void (*guest)(void)) {
+     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
+     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
+-    if (!getenv("DM_WINDOW")) { guest(); return; }
++    const char *relay = getenv("DM_STREAM_RELAY");
++    g_stream_relay = relay && *relay;
++    if (!g_stream_relay && !getenv("DM_WINDOW")) { guest(); return; }
+     @autoreleasepool {
+         [NSApplication sharedApplication];
++        if (g_stream_relay) {
++            [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
++            GCController.shouldMonitorBackgroundEvents = YES;
++            dm_haptics_apple_init();
++            front_controllers_start();
++            dm_focus_set(1);
++            LOG("front end: windowless stream relay, system controllers enabled");
++            run_guest_with_appkit(guest);
++            return;
++        }
+         // DM_CURSOR_HIDDEN=1 (see the pointer below) hides it here, before the app takes the front: a hide after the window left the pointer up until it ran. The
+         // launcher's console also yields the front to the game rather than let LaunchServices activate it when it registers, which shows the pointer whatever the app
+         // hid (issue #380)
+@@ -1556,11 +1583,7 @@
+         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; input_release(); dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
+         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];
+         display_awake(win.isKeyWindow);   // the window may have become key (makeKeyAndOrderFront above) before these observers were installed
+-        // Guest thread: 64 MiB stack (the Switch main thread stack is specified by npdm; the host gives plenty)
+-        static guest_arg ga; ga.fn = guest;
+-        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 64u << 20);
+-        pthread_t th; if (pthread_create(&th, &a, guest_tramp, &ga)) die("pthread_create guest");
+-        [NSApp run];
++        run_guest_with_appkit(guest);
+     }
+ }
+ 
+--- a/dm/host/controllers_mac.m
++++ b/dm/host/controllers_mac.m
+@@ -1293,6 +1293,9 @@
+     dm_switch2_start(&s2front);
+     dm_motion_pro_start(controller_pro_changed);
+     dm_motion_pro_active(g_focus);
+-    for(NSNotificationName name in @[NSApplicationDidResignActiveNotification,NSApplicationDidBecomeActiveNotification])
+-        [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { front_controllers_focus([n.name isEqual:NSApplicationDidBecomeActiveNotification]); }];
++    // The windowless relay opts into background controller events for its lifetime.
++    if (!GCController.shouldMonitorBackgroundEvents) {
++        for(NSNotificationName name in @[NSApplicationDidResignActiveNotification,NSApplicationDidBecomeActiveNotification])
++            [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { front_controllers_focus([n.name isEqual:NSApplicationDidBecomeActiveNotification]); }];
++    }
+ }
+--- a/dm/host/haptics_apple.m
++++ b/dm/host/haptics_apple.m
+@@ -8,6 +8,7 @@
+ #import <AVFAudio/AVFAudio.h>
+ #else
+ #import <AppKit/AppKit.h>
++#import <GameController/GameController.h>
+ #import <IOKit/IOKitLib.h>
+ #import <IOKit/hid/IOHIDDevice.h>
+ #endif
+@@ -607,8 +608,10 @@
+         (void)n; dm_haptics_clear(0);
+     }];
+ #else
+-    g_haptics_obs[0] = [nc addObserverForName:NSApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, YES); }];
+-    g_haptics_obs[1] = [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, NO); }];
++    if (!GCController.shouldMonitorBackgroundEvents) {
++        g_haptics_obs[0] = [nc addObserverForName:NSApplicationWillResignActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, YES); }];
++        g_haptics_obs[1] = [nc addObserverForName:NSApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; suspend(DM_HAPTICS_INACTIVE, NO); }];
++    }
+     g_haptics_obs[2] = [nc addObserverForName:NSApplicationWillTerminateNotification object:nil queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_haptics_apple_shutdown(); }];
+ #endif
+     if (!g_haptics_atexit) { g_haptics_atexit = 1; atexit(dm_haptics_apple_shutdown); }
+--- a/dm/host/hle_audio.c
++++ b/dm/host/hle_audio.c
+@@ -8,6 +8,13 @@
+ #include <dispatch/dispatch.h>
+ #include <stdatomic.h>
+ #include <unistd.h>
++#if TARGET_OS_OSX
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <time.h>
++#endif
+ 
+ enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
+ enum { BK_NONE, BK_AU, BK_NULL };   // what is consuming an output's queue right now (aout.backend)
+@@ -150,8 +157,85 @@
+             *out++ = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+         }
+         frames -= n;
++    }
++}
++
++#if TARGET_OS_OSX
++enum { RELAY_AUDIO_FRAMES = RATE / 200 };
++typedef struct {
++    uint64_t uptime_ns;
++    int16_t samples[RELAY_AUDIO_FRAMES * 2];
++} relay_audio_packet;
++_Static_assert(sizeof(relay_audio_packet) == 968, "unexpected stream audio packet layout");
++
++static int g_audio_relay_fd = -1;
++static struct sockaddr_un g_audio_relay_addr;
++static _Atomic(aout *) g_audio_relay_output;
++
++static void audio_relay_init(void) {
++    const char *path = getenv("DM_STREAM_AUDIO_SOCKET");
++    if (!path || !*path) return;
++    size_t size = strlen(path);
++    if (path[0] != '/' || size >= sizeof g_audio_relay_addr.sun_path) {
++        LOG("[RED] stream audio: invalid Unix socket path");
++        return;
++    }
++    char parent[sizeof g_audio_relay_addr.sun_path];
++    memcpy(parent, path, size + 1);
++    char *last = strrchr(parent, '/');
++    if (last == parent || !last[1]) {
++        LOG("[RED] stream audio: a private socket directory is required");
++        return;
++    }
++    *last = '\0';
++    struct stat st;
++    if (lstat(parent, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0077)) {
++        LOG("[RED] stream audio: the socket directory must be private and owned by this user");
++        return;
++    }
++    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++    if (fd < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, O_NONBLOCK)) {
++        if (fd >= 0) close(fd);
++        LOG("[RED] stream audio: cannot open the nonblocking Unix socket");
++        return;
++    }
++    g_audio_relay_addr.sun_family = AF_UNIX;
++    memcpy(g_audio_relay_addr.sun_path, path, size + 1);
++    g_audio_relay_addr.sun_len = SUN_LEN(&g_audio_relay_addr);
++    g_audio_relay_fd = fd;
++    LOG("stream audio: sending 48 kHz stereo PCM to the local relay");
++}
++
++static bool audio_relay_enabled(void) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, audio_relay_init);
++    return g_audio_relay_fd >= 0;
++}
++
++static bool audio_relay_pull(aout *a) {
++    if (g_audio_relay_fd < 0 || (a->ch != 1 && a->ch != 2 && a->ch != 6)) return false;
++    // A stream uses one guest audio device. Keep later outputs paced without interleaving their packets.
++    aout *owner = NULL;
++    if (!atomic_compare_exchange_strong(&g_audio_relay_output, &owner, a) && owner != a) return false;
++
++    relay_audio_packet packet;
++    if (a->ch == 1) {
++        int16_t mono[RELAY_AUDIO_FRAMES];
++        pull(a, (uint8_t *)mono, sizeof mono);
++        for (unsigned i = 0; i < RELAY_AUDIO_FRAMES; i++) {
++            packet.samples[i * 2] = mono[i];
++            packet.samples[i * 2 + 1] = mono[i];
++        }
++    } else {
++        pull_device(a, (uint8_t *)packet.samples, sizeof packet.samples);
+     }
++    packet.uptime_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    // A missing or slow receiver must never stall the game's audio queue.
++    (void)sendto(g_audio_relay_fd, &packet, sizeof packet, MSG_DONTWAIT,
++                 (const struct sockaddr *)&g_audio_relay_addr, g_audio_relay_addr.sun_len);
++    return true;
+ }
++#endif
+ 
+ static _Atomic uint64_t g_render_calls;   // Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
+ uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
+@@ -264,8 +348,15 @@
+     while (atomic_load_explicit(&a->null_run, memory_order_acquire)) {
+         t += 5000000; uint64_t now = now_ns();
+         if (t > now) usleep((useconds_t)((t - now) / 1000)); else if (now - t > 100000000) t = now;
++#if TARGET_OS_OSX
++        if (audio_relay_pull(a)) continue;
++#endif
+         pull(a, scratch, bytes);
+     }
++#if TARGET_OS_OSX
++    aout *owner = a;
++    atomic_compare_exchange_strong(&g_audio_relay_output, &owner, NULL);
++#endif
+     return NULL;
+ }
+ // Backend changes; callers hold g_aos_lock. pull() takes no lock, so joining a sink under it cannot deadlock
+@@ -430,6 +521,9 @@
+     pthread_create(&a->notify_th, NULL, event_notify, a);
+     if (ev) hle_bind_system_event(ev, 1);   // Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
+     char sb[64]; int use_au = real_audio();
++#if TARGET_OS_OSX
++    if (audio_relay_enabled()) use_au = 0;
++#endif
+     LOG("audio #%d OpenAudioOut %s channels %d %s%s (call site %s)", a->id, name ? name : "(default)", ch, use_au ? "real output" : "silent sink", ev ? "" : ", no release event (the game polls)", site(lr, sb, sizeof sb));
+     // The helper finishes (and is joined) before lifecycle/watchdog readers can find this output.
+     // Keep construction outside g_aos_lock: joining the helper can yield the guest core.

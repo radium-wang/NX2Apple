@@ -1,0 +1,36 @@
+<!doctype html><meta charset="utf-8"><title>RP Duo system gamepad probe</title>
+<style>body{font:24px system-ui;margin:36px;background:#102238;color:white}button{font:inherit;padding:.6em}#indicator{position:fixed;left:30%;right:12%;top:32%;bottom:12%;background:#1239b0}</style>
+<p id="pad">Press a controller button to make it visible.</p>
+<button id="pulse">Play 300 ms ordinary vibration</button> <span id="result"></span>
+<div id="indicator"></div>
+<script>
+const status = document.querySelector('#pad');
+const indicator = document.querySelector('#indicator');
+let gamepad;
+let previousPulse = false;
+function update() {
+  gamepad = Array.from(navigator.getGamepads()).find(p => p && p.mapping === 'standard');
+  if (gamepad) {
+    const down = gamepad.buttons[13]?.pressed;
+    const pulse = gamepad.buttons[2]?.pressed;
+    if (pulse && !previousPulse) document.querySelector('#pulse').click();
+    previousPulse = pulse;
+    indicator.style.background = down ? '#f82020' : '#1239b0';
+    status.textContent = gamepad.id + ' • D-pad down: ' + (down ? 'pressed' : 'released');
+  }
+  requestAnimationFrame(update);
+}
+requestAnimationFrame(update);
+document.querySelector('#pulse').onclick = async () => {
+  const result = document.querySelector('#result');
+  try {
+    const actuator = gamepad?.vibrationActuator;
+    if (!actuator) throw Error('No vibration actuator');
+    result.textContent = await actuator.playEffect('dual-rumble', {
+      startDelay: 0, duration: 300, weakMagnitude: 0.5, strongMagnitude: 0.7
+    });
+  } catch (e) {
+    result.textContent = e.message;
+  }
+};
+</script>

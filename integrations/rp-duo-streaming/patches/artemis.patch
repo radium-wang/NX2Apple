@@ -1,0 +1,150 @@
+diff --git a/app/build.gradle b/app/build.gradle
+index c706dbf..3346727 100644
+--- a/app/build.gradle
++++ b/app/build.gradle
+@@ -95,10 +95,10 @@ android {
+ 
+     buildTypes {
+         debug {
+-            applicationIdSuffix ".noirdebug"
+-            resValue "string", "app_label", "Diana"
+-            resValue "string", "app_label_root", "Diana (Root)"
+-            resValue "string", "app_label_game", "Diana (Game)"
++            applicationIdSuffix ".rpduo"
++            resValue "string", "app_label", "Artemis RP Duo"
++            resValue "string", "app_label_root", "Artemis RP Duo (Root)"
++            resValue "string", "app_label_game", "Artemis RP Duo"
+ 
+             minifyEnabled true
+             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+diff --git a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
+index b084917..734a4cb 100755
+--- a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
++++ b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
+@@ -127,6 +127,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+     private final Handler mainThreadHandler;
+     private final HandlerThread backgroundHandlerThread;
+     private final Handler backgroundThreadHandler;
++    private final RetroidDuoRumble retroidDuoRumble;
+     private boolean hasGameController;
+     private boolean stopped = false;
+ 
+@@ -148,6 +149,14 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+         this.backgroundHandlerThread = new HandlerThread("ControllerHandler");
+         this.backgroundHandlerThread.start();
+         this.backgroundThreadHandler = new Handler(backgroundHandlerThread.getLooper());
++        this.retroidDuoRumble = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
++                && "Retroid Pocket Duo".equals(Build.MODEL) && deviceVibrator.hasVibrator()
++                ? new RetroidDuoRumble(deviceVibrator, backgroundThreadHandler) : null;
++        if (retroidDuoRumble != null) {
++            RetroidDuoFrequencySink frequencySink = Build.VERSION.SDK_INT >= 36
++                    ? RetroidDuoFrequencySink.create(deviceVibrator) : null;
++            RawHapticsReceiver.setSink(frequencySink != null ? frequencySink : retroidDuoRumble);
++        }
+ 
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+             this.deviceVibratorManager = (VibratorManager) activityContext.getSystemService(Context.VIBRATOR_MANAGER_SERVICE);
+@@ -289,6 +298,10 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+             deviceContext.destroy();
+         }
+ 
++        if (retroidDuoRumble != null) {
++            RawHapticsReceiver.setSink(null);
++            retroidDuoRumble.close();
++        }
+         deviceVibrator.cancel();
+     }
+ 
+@@ -736,7 +749,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+         context.hasPaddles = MoonBridge.guessControllerHasPaddles(context.vendorId, context.productId);
+         context.hasShare = MoonBridge.guessControllerHasShareButton(context.vendorId, context.productId);
+ 
+-        if (prefConfig.enableDeviceRumble) {
++        // Retroid firmware exposes the same built-in pad under either controller mode.
++        boolean builtInRetroidController = retroidDuoRumble != null
++                && dev.getVendorId() == 0x2022
++                && (dev.getProductId() == 0x3001 || dev.getProductId() == 0x3002);
++        if (prefConfig.enableDeviceRumble || builtInRetroidController) {
+             context.vibrator = deviceVibrator;
+         } else {
+             // Try to use the InputDevice's associated vibrators first
+@@ -2113,6 +2130,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+         short highFreqMotorMSB = (short)((highFreqMotor >> 8) & 0xFF);
+         int simulatedAmplitude = Math.min(255, (int)((lowFreqMotorMSB * 0.80) + (highFreqMotorMSB * 0.33)));
+ 
++        if (retroidDuoRumble != null && vibrator == deviceVibrator) {
++            retroidDuoRumble.setMagnitude(simulatedAmplitude);
++            return;
++        }
++
+         if (simulatedAmplitude == 0) {
+             // This case is easy - just cancel the current effect and get out.
+             // NB: We cannot simply check lowFreqMotor == highFreqMotor == 0
+diff --git a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
+index de2f617..277fe8a 100755
+--- a/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
++++ b/app/src/main/java/com/limelight/nvstream/jni/MoonBridge.java
+@@ -287,11 +287,16 @@ public class MoonBridge {
+     }
+ 
+     public static void bridgeClConnectionTerminated(int errorCode) {
++        com.limelight.binding.input.RawHapticsReceiver.reset();
+         if (connectionListener != null) {
+             connectionListener.connectionTerminated(errorCode);
+         }
+     }
+ 
++    public static void bridgeClRawHaptics(byte[] frame) {
++        com.limelight.binding.input.RawHapticsReceiver.receive(frame);
++    }
++
+     public static void bridgeClRumble(short controllerNumber, short lowFreqMotor, short highFreqMotor) {
+         if (connectionListener != null) {
+             connectionListener.rumble(controllerNumber, lowFreqMotor, highFreqMotor);
+diff --git a/app/src/main/jni/moonlight-core/callbacks.c b/app/src/main/jni/moonlight-core/callbacks.c
+index 6b6e13a..a82d4b7 100644
+--- a/app/src/main/jni/moonlight-core/callbacks.c
++++ b/app/src/main/jni/moonlight-core/callbacks.c
+@@ -33,6 +33,7 @@ static jmethodID BridgeClStageFailedMethod;
+ static jmethodID BridgeClConnectionStartedMethod;
+ static jmethodID BridgeClConnectionTerminatedMethod;
+ static jmethodID BridgeClRumbleMethod;
++static jmethodID BridgeClRawHapticsMethod;
+ static jmethodID BridgeClConnectionStatusUpdateMethod;
+ static jmethodID BridgeClSetHdrModeMethod;
+ static jmethodID BridgeClRumbleTriggersMethod;
+@@ -96,6 +97,7 @@ Java_com_limelight_nvstream_jni_MoonBridge_init(JNIEnv *env, jclass clazz) {
+     BridgeClStageFailedMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClStageFailed", "(II)V");
+     BridgeClConnectionStartedMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClConnectionStarted", "()V");
+     BridgeClConnectionTerminatedMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClConnectionTerminated", "(I)V");
++    BridgeClRawHapticsMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClRawHaptics", "([B)V");
+     BridgeClRumbleMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClRumble", "(SSS)V");
+     BridgeClConnectionStatusUpdateMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClConnectionStatusUpdate", "(I)V");
+     BridgeClSetHdrModeMethod = (*env)->GetStaticMethodID(env, clazz, "bridgeClSetHdrMode", "(Z[B)V");
+@@ -312,6 +314,18 @@ void BridgeClConnectionTerminated(int errorCode) {
+     }
+ }
+ 
++// Forward validated raw bytes, without JNI-side conversion or mixing.
++void BridgeClRawHaptics(const unsigned char *frame) {
++    JNIEnv *env = GetThreadEnv();
++    jbyteArray bytes = (*env)->NewByteArray(env, 64);
++    if (bytes) {
++        (*env)->SetByteArrayRegion(env, bytes, 0, 64, (const jbyte *)frame);
++        (*env)->CallStaticVoidMethod(env, GlobalBridgeClass, BridgeClRawHapticsMethod, bytes);
++        (*env)->DeleteLocalRef(env, bytes);
++    }
++    if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
++}
++
+ void BridgeClRumble(unsigned short controllerNumber, unsigned short lowFreqMotor, unsigned short highFreqMotor) {
+     JNIEnv* env = GetThreadEnv();
+ 
+@@ -421,6 +435,7 @@ static CONNECTION_LISTENER_CALLBACKS BridgeConnListenerCallbacks = {
+         .connectionTerminated = BridgeClConnectionTerminated,
+         .logMessage = BridgeClLogMessage,
+         .rumble = BridgeClRumble,
++        .rawHaptics = BridgeClRawHaptics,
+         .connectionStatusUpdate = BridgeClConnectionStatusUpdate,
+         .setHdrMode = BridgeClSetHdrMode,
+         .rumbleTriggers = BridgeClRumbleTriggers,

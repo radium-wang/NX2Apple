@@ -33,6 +33,7 @@ struct LauncherView: View {
     @State var launchHintGeneration = 0
     @StateObject var cloudGate = CloudSaveGate()   // the check of the cloud's save before a start (CloudSaveGate.swift, #957)
     @State var launchError: String?
+    @State var directLaunchReady = false
     @State private var removing: LibraryGame?
     @State private var selectingGames = false   // the Build selected games sheet (BuildSelectedSheet.swift)
     @State private var deleting: LibraryGame?   // the game whose Delete sheet is open (DeleteGameSheet.swift)
@@ -302,12 +303,12 @@ struct LauncherView: View {
         .onChange(of: scenePhase) { phase in
             if phase == .active { library.objectWillChange.send() }
         }
-        .alert(loc.t("library.error"), isPresented: Binding(
-            get: { launchError != nil || library.error != nil },
-            set: { if !$0 { launchError = nil; library.error = nil } }
+        .alert(loc.t(directLaunchReady ? "launch.direct.ready" : "library.error"), isPresented: Binding(
+            get: { directLaunchReady || launchError != nil || library.error != nil },
+            set: { if !$0 { directLaunchReady = false; launchError = nil; library.error = nil } }
         )) {
-            Button(loc.t("library.ok")) { launchError = nil; library.error = nil }
-        } message: { Text(launchError ?? library.error ?? "") }
+            Button(loc.t("library.ok")) { directLaunchReady = false; launchError = nil; library.error = nil }
+        } message: { Text(directLaunchReady ? loc.t("launch.direct.connect") : launchError ?? library.error ?? "") }
         .confirmationDialog(loc.t("library.removeQuestion"), isPresented: Binding(
             get: { removing != nil }, set: { if !$0 { removing = nil } }
         ), titleVisibility: .visible) {
@@ -320,7 +321,13 @@ struct LauncherView: View {
             if let id = optionsFor { LaunchOptionsView(m: m, library: library, gameID: id, globalControls: controls, controllerMappingPresentation: $controllerMappingOpen,
                               onBuild: { game in DispatchQueue.main.async { configureBuild(game) } },
                               openCheats: { id in optionsFor = nil; DispatchQueue.main.async { cheatsFor = id } },
-                              openSaves: { id in optionsFor = nil; DispatchQueue.main.async { savesFor = id } }).environmentObject(padFocus).environmentObject(stores.saveSettings).environmentObject(stores.players).launcherDropdownHost() }
+                              openSaves: { id in optionsFor = nil; DispatchQueue.main.async { savesFor = id } },
+                              openDirect: { id in
+                                  optionsFor = nil
+                                  DispatchQueue.main.async {
+                                      if let game = library.games.first(where: { $0.id == id }) { primaryAction(game) }
+                                  }
+                              }).environmentObject(padFocus).environmentObject(stores.saveSettings).environmentObject(stores.players).launcherDropdownHost() }
         }
         .sheet(isPresented: $controlsOpen) { ControlsView(layout: controls, cancelRequest: controlsCancelRequest).environmentObject(padFocus).launcherDropdownHost() }
         .sheet(isPresented: Binding(get: { freeSpaceFor != nil }, set: { if !$0 { freeSpaceFor = nil } })) {

@@ -633,6 +633,12 @@ final class GameLibrary: ObservableObject {
         }
     }
 
+    func setDirectDisplay(_ enabled: Bool, for id: UUID) {
+        guard var game = games.first(where: { $0.id == id }) else { return }
+        game.launchOptions[DirectStream.preferenceKey] = enabled ? "1" : nil
+        upsert(game)
+    }
+
     /// A mod switched on or off for one game.
     func setMod(_ name: String, on: Bool, for id: UUID) {
         guard var game = games.first(where: { $0.id == id }) else { return }

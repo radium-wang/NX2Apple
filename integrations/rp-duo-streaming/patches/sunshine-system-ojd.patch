@@ -1,0 +1,910 @@
+diff --git a/src/platform/virtualhid_input.cpp b/src/platform/virtualhid_input.cpp
+index c2056a7..3cfa84c 100644
+--- a/src/platform/virtualhid_input.cpp
++++ b/src/platform/virtualhid_input.cpp
+@@ -1212,7 +1212,7 @@ namespace platf {
+ 
+     if (nexus::ojd::sunshine::global_bridge().availability() ==
+         nexus::ojd::sunshine::Availability::ready) {
+-      if (nexus::ojd::sunshine::alloc_gamepad(id.globalIndex) == 0) {
++      if (nexus::ojd::sunshine::alloc_gamepad(id, feedback_queue) == 0) {
+         BOOST_LOG(info) << "Gamepad "sv << id.globalIndex << " uses the OpenJoystickDriver backend"sv;
+         return 0;
+       }
+@@ -1222,6 +1222,11 @@ namespace platf {
+   }
+ 
+   int rebind_gamepad(input_t &input, const gamepad_id_t &id, feedback_queue_t feedback_queue) {
++#if defined(__APPLE__)
++    if (nexus::ojd::sunshine::rebind_gamepad(id, feedback_queue)) {
++      return 0;
++    }
++#endif
+     return virtualhid::rebind_gamepad(virtualhid::get_input_context(input), id, std::move(feedback_queue));
+   }
+ 
+diff --git a/third-party/nexus-ojd/include/nexus/ojd/feed_client.hpp b/third-party/nexus-ojd/include/nexus/ojd/feed_client.hpp
+index e4cf8db..c01c1b2 100644
+--- a/third-party/nexus-ojd/include/nexus/ojd/feed_client.hpp
++++ b/third-party/nexus-ojd/include/nexus/ojd/feed_client.hpp
+@@ -80,12 +80,8 @@ class FeedClient {
+   /// Keep the feed alive without changing pad state (resets the 2s timeout).
+   bool send_keepalive();
+ 
+-  /// Wait up to `timeout` for OJD to send a line, and return a rumble command if
+-  /// that line was one. Intended for a dedicated reader thread: it consumes the
+-  /// socket's read side, so a caller must not also call read_reply() directly.
+-  ///
+-  /// Returns nullopt on timeout, on end of stream, and for any non-rumble line.
+-  std::optional<RumbleCommand> wait_for_rumble(std::chrono::milliseconds timeout);
++  /// Return an available rumble message without blocking the input sender.
++  std::optional<RumbleCommand> poll_rumble();
+ 
+   /// Ask OJD to report when queued frames have played, then close.
+   void disconnect();
+@@ -96,7 +92,7 @@ class FeedClient {
+ 
+  private:
+   bool write_line(const std::string &line);
+-  [[nodiscard]] std::optional<Reply> read_reply();
++  [[nodiscard]] std::optional<Reply> read_reply(int receive_flags = 0);
+   void close_socket();
+   /// Map a Status failure onto a typed error.
+   [[nodiscard]] ConnectResult classify_failure(const Reply &reply) const;
+diff --git a/third-party/nexus-ojd/include/nexus/ojd/pad_session.hpp b/third-party/nexus-ojd/include/nexus/ojd/pad_session.hpp
+index b61ff21..d6876e5 100644
+--- a/third-party/nexus-ojd/include/nexus/ojd/pad_session.hpp
++++ b/third-party/nexus-ojd/include/nexus/ojd/pad_session.hpp
+@@ -41,7 +41,7 @@ struct SessionConfig {
+   bool reconnect = true;
+   std::chrono::milliseconds reconnect_initial{250};
+   std::chrono::milliseconds reconnect_max{5000};
+-  /// Called on the session's reader thread when a game requests rumble for this
++  /// Called on the session's worker thread when a game requests rumble for this
+   /// pad. The first argument is the slot this session was created for. Must be
+   /// cheap and must not call back into the session.
+   std::function<void(int slot, const RumbleCommand &)> on_rumble;
+@@ -74,7 +74,6 @@ class PadSession {
+ 
+  private:
+   void run();
+-  void read_rumble();
+   /// Reconnect after a failed feed. Returns false when the session should stop.
+   bool reconnect_locked();
+ 
+@@ -83,18 +82,15 @@ class PadSession {
+   FeedClient client_;
+ 
+   std::thread thread_;
+-  std::thread rumble_thread_;
+   mutable std::mutex mutex_;
+   std::condition_variable wake_;
+ 
+   GamepadState pending_{};
+-  GamepadState published_{};
+   bool has_pending_ = false;
+   bool stop_requested_ = false;
+   bool running_ = false;
+   ConnectError last_error_ = ConnectError::none;
+   int reconnect_count_ = 0;
+-  bool needs_full_frame_ = true;
+ };
+ 
+ /// Owns the sessions for a Sunshine stream's gamepad slots.
+diff --git a/third-party/nexus-ojd/include/nexus/ojd/protocol.hpp b/third-party/nexus-ojd/include/nexus/ojd/protocol.hpp
+index e97da8b..0f1210a 100644
+--- a/third-party/nexus-ojd/include/nexus/ojd/protocol.hpp
++++ b/third-party/nexus-ojd/include/nexus/ojd/protocol.hpp
+@@ -30,6 +30,8 @@ enum class Persona {
+   generic,
+   /// An Xbox Adaptive Controller identity: what SDL and Steam read reliably.
+   sdl_compatible,
++  /// An Xbox Wireless Controller identity for Apple GameController.
++  game_controller_compatible,
+ };
+ 
+ [[nodiscard]] std::string_view to_string(Persona persona) noexcept;
+diff --git a/third-party/nexus-ojd/include/nexus/ojd/state_mapping.hpp b/third-party/nexus-ojd/include/nexus/ojd/state_mapping.hpp
+index a9b0946..1d738d2 100644
+--- a/third-party/nexus-ojd/include/nexus/ojd/state_mapping.hpp
++++ b/third-party/nexus-ojd/include/nexus/ojd/state_mapping.hpp
+@@ -45,7 +45,7 @@ struct GamepadState {
+   std::uint32_t button_flags{};
+   std::uint8_t lt{};
+   std::uint8_t rt{};
+-  /// Sticks are -32768..32767 with positive Y down, which matches OJD already.
++  /// Sticks are -32768..32767 with positive Y up in Moonlight.
+   std::int16_t lx{};
+   std::int16_t ly{};
+   std::int16_t rx{};
+@@ -57,9 +57,6 @@ struct GamepadState {
+ struct MapOptions {
+   /// Convert triggers as 0..255 -> 0..1. Moonlight triggers are already 0..255.
+   bool triggers_are_bytes = true;
+-  /// Emit every axis on every frame (OJD treats omitted controls as neutral, so
+-  /// this only matters if a caller wants full-frame semantics).
+-  bool full_frames = false;
+ };
+ 
+ namespace detail {
+@@ -67,12 +64,7 @@ namespace detail {
+ [[nodiscard]] double stick_to_unit(std::int16_t value) noexcept;
+ }  // namespace detail
+ 
+-/// Build a frame containing only the controls that differ from `previous`.
+-/// Passing a default-constructed previous yields the full non-neutral state.
+-[[nodiscard]] Frame diff_frame(const GamepadState &previous, const GamepadState &current,
+-                              const MapOptions &options = {});
+-
+-/// Build a frame containing every control, for the first frame after connect.
++/// Build an absolute frame containing all held controls for the OJD endpoint.
+ [[nodiscard]] Frame full_frame(const GamepadState &state, const MapOptions &options = {});
+ 
+ }  // namespace nexus::ojd
+diff --git a/third-party/nexus-ojd/include/nexus/ojd/sunshine_adapter.hpp b/third-party/nexus-ojd/include/nexus/ojd/sunshine_adapter.hpp
+index 4a5a76a..c9cd88a 100644
+--- a/third-party/nexus-ojd/include/nexus/ojd/sunshine_adapter.hpp
++++ b/third-party/nexus-ojd/include/nexus/ojd/sunshine_adapter.hpp
+@@ -1,22 +1,17 @@
+ // Declarations for the Sunshine-side OJD adapter.
+-//
+-// Kept separate from src/sunshine_adapter.cpp so Sunshine's input backend can
+-// call these without including Sunshine headers itself. The definitions live in
+-// the adapter TU, which does include src/platform/common.h.
+ #pragma once
+ 
+-#include <cstdint>
+-
+-// Forward declaration keeps this header usable from Sunshine's backend.
+-namespace platf {
+-struct gamepad_state_t;
+-}
++#include "src/platform/common.h"
+ 
+ namespace nexus::ojd::sunshine {
+ 
+ /// Allocate a virtual pad in `slot`. Returns 0 on success, -1 when the backend
+ /// is unavailable or the slot is out of range.
+-int alloc_gamepad(int slot);
++int alloc_gamepad(const platf::gamepad_id_t &id, const platf::feedback_queue_t &queue);
++
++/// Update the feedback destination when a client resumes its controller slot.
++/// Returns false for a slot owned by the other virtual input backend.
++bool rebind_gamepad(const platf::gamepad_id_t &id, const platf::feedback_queue_t &queue);
+ 
+ /// Release the virtual pad in `slot`. Safe to call for a slot with no pad.
+ void free_gamepad(int slot);
+diff --git a/third-party/nexus-ojd/src/feed_client.cpp b/third-party/nexus-ojd/src/feed_client.cpp
+index 3a1a2b7..6c2cc46 100644
+--- a/third-party/nexus-ojd/src/feed_client.cpp
++++ b/third-party/nexus-ojd/src/feed_client.cpp
+@@ -89,7 +89,7 @@ bool FeedClient::write_line(const std::string &line) {
+   return true;
+ }
+ 
+-std::optional<Reply> FeedClient::read_reply() {
++std::optional<Reply> FeedClient::read_reply(int receive_flags) {
+   if (socket_ < 0) {
+     return std::nullopt;
+   }
+@@ -107,7 +107,7 @@ std::optional<Reply> FeedClient::read_reply() {
+     }
+ 
+     char buffer[4096];
+-    const auto received = ::recv(socket_, buffer, sizeof(buffer), 0);
++    const auto received = ::recv(socket_, buffer, sizeof(buffer), receive_flags);
+     if (received < 0) {
+       if (errno == EINTR) {
+         continue;
+@@ -265,30 +265,9 @@ bool FeedClient::send_keepalive() {
+   return true;
+ }
+ 
+-std::optional<RumbleCommand> FeedClient::wait_for_rumble(std::chrono::milliseconds timeout) {
+-  if (socket_ < 0) {
+-    return std::nullopt;
+-  }
+-
+-  // Use select() rather than SO_RCVTIMEO: the send path also uses this socket,
+-  // and a receive timeout would apply to writes as well.
+-  fd_set readable;
+-  FD_ZERO(&readable);
+-  FD_SET(socket_, &readable);
+-  timeval value{};
+-  value.tv_sec = static_cast<time_t>(timeout.count() / 1000);
+-  value.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
+-
+-  const int ready = ::select(socket_ + 1, &readable, nullptr, nullptr, &value);
+-  if (ready <= 0) {
+-    return std::nullopt;
+-  }
+-
+-  const auto reply = read_reply();
+-  if (!reply) {
+-    return std::nullopt;
+-  }
+-  return parse_rumble_command(*reply);
++std::optional<RumbleCommand> FeedClient::poll_rumble() {
++  const auto reply = read_reply(MSG_DONTWAIT);
++  return reply ? parse_rumble_command(*reply) : std::nullopt;
+ }
+ 
+ void FeedClient::disconnect() {
+diff --git a/third-party/nexus-ojd/src/pad_session.cpp b/third-party/nexus-ojd/src/pad_session.cpp
+index 56ca261..c449745 100644
+--- a/third-party/nexus-ojd/src/pad_session.cpp
++++ b/third-party/nexus-ojd/src/pad_session.cpp
+@@ -1,6 +1,7 @@
+ #include "nexus/ojd/pad_session.hpp"
+ 
+ #include <algorithm>
++#include <optional>
+ 
+ namespace nexus::ojd {
+ 
+@@ -33,8 +34,6 @@ ConnectResult PadSession::start() {
+       return {};
+     }
+     stop_requested_ = false;
+-    needs_full_frame_ = true;
+-    published_ = GamepadState{};
+   }
+ 
+   FeedConfig feed;
+@@ -57,9 +56,6 @@ ConnectResult PadSession::start() {
+     running_ = true;
+   }
+   thread_ = std::thread([this]() { run(); });
+-  if (config_.on_rumble) {
+-    rumble_thread_ = std::thread([this]() { read_rumble(); });
+-  }
+   return result;
+ }
+ 
+@@ -102,8 +98,8 @@ bool PadSession::reconnect_locked() {
+       ++reconnect_count_;
+       last_error_ = ConnectError::none;
+       running_ = true;
+-      has_pending_ = false;
+-      published_ = GamepadState{};
++      // Restore the latest state on the new device, including updates received during reconnect.
++      has_pending_ = true;
+       return true;
+     }
+ 
+@@ -125,25 +121,6 @@ bool PadSession::reconnect_locked() {
+   }
+ }
+ 
+-void PadSession::read_rumble() {
+-  while (true) {
+-    {
+-      std::lock_guard lock(mutex_);
+-      if (stop_requested_) {
+-        break;
+-      }
+-    }
+-
+-    const auto command = client_.wait_for_rumble(std::chrono::milliseconds(100));
+-    if (!command) {
+-      continue;
+-    }
+-    if (config_.on_rumble) {
+-      config_.on_rumble(slot_, *command);
+-    }
+-  }
+-}
+-
+ void PadSession::update(const GamepadState &state) {
+   {
+     std::lock_guard lock(mutex_);
+@@ -159,69 +136,89 @@ void PadSession::update(const GamepadState &state) {
+ void PadSession::run() {
+   const auto frame_period = std::chrono::microseconds(
+       config_.max_fps > 0 ? 1'000'000 / config_.max_fps : 8'000);
+-  auto last_send = std::chrono::steady_clock::now() - config_.keepalive_after;
++  using Clock = std::chrono::steady_clock;
++  using namespace std::chrono_literals;
++  auto next_frame = Clock::now();
++  auto next_keepalive = next_frame + config_.keepalive_after;
++  auto next_rumble = config_.on_rumble ? next_frame : Clock::time_point::max();
++  auto rumble_end = Clock::time_point::max();
++  std::optional<RumbleCommand> active_rumble;
++  // Core Haptics refreshes the virtual pad around the end of each interval.
++  // Allow for refresh and socket polling jitter before synthesizing a stop.
++  constexpr auto rumble_refresh_grace = 24ms;
++
++  const auto stop_rumble = [&] {
++    if (active_rumble) {
++      config_.on_rumble(slot_, RumbleCommand {});
++      active_rumble.reset();
++    }
++    rumble_end = Clock::time_point::max();
++  };
+ 
+   while (true) {
+-    GamepadState state;
+-    bool send = false;
+-    bool full = false;
+-    bool keepalive = false;
+-
++    std::optional<GamepadState> state;
+     {
+       std::unique_lock lock(mutex_);
+-      if (stop_requested_) {
+-        break;
++      const auto deadline = std::min({next_keepalive, next_rumble, rumble_end});
++      wake_.wait_until(lock, deadline, [this]() { return stop_requested_ || has_pending_; });
++      if (has_pending_) {
++        // OJD plays each frame for at least 8 ms. Coalesce faster updates so
++        // input does not accumulate in its playback queue.
++        wake_.wait_until(lock, std::min(next_frame, deadline), [this]() { return stop_requested_; });
+       }
+-
+-      // Wake for a new frame, for the keepalive deadline, or for shutdown.
+-      wake_.wait_for(lock, std::min<std::chrono::milliseconds>(
+-                                std::chrono::duration_cast<std::chrono::milliseconds>(frame_period),
+-                                config_.keepalive_after),
+-                     [this]() { return stop_requested_ || has_pending_; });
+-
+       if (stop_requested_) {
+         break;
+       }
+-
+-      const auto now = std::chrono::steady_clock::now();
+-      if (has_pending_) {
++      if (has_pending_ && Clock::now() >= next_frame) {
+         state = pending_;
+         has_pending_ = false;
+-        full = needs_full_frame_;
+-        needs_full_frame_ = false;
+-        send = true;
+-      } else if (now - last_send >= config_.keepalive_after) {
+-        keepalive = true;
+       }
+     }
+ 
+-    if (send) {
+-      Frame frame = full ? full_frame(state) : diff_frame(published_, state);
+-      if (!client_.send_frame(frame)) {
+-        if (!reconnect_locked()) {
+-          break;
++    auto now = Clock::now();
++    if (now >= next_rumble) {
++      if (const auto feedback = client_.poll_rumble()) {
++        const bool vibrating = feedback->set && (feedback->low_frequency || feedback->high_frequency ||
++                                                 feedback->left_trigger || feedback->right_trigger);
++        if (vibrating) {
++          if (!active_rumble || active_rumble->low_frequency != feedback->low_frequency ||
++              active_rumble->high_frequency != feedback->high_frequency ||
++              active_rumble->left_trigger != feedback->left_trigger ||
++              active_rumble->right_trigger != feedback->right_trigger) {
++            config_.on_rumble(slot_, *feedback);
++          }
++          active_rumble = feedback;
++          rumble_end = feedback->duration_milliseconds > 0
++                           ? now + std::chrono::milliseconds(feedback->duration_milliseconds) + rumble_refresh_grace
++                           : Clock::time_point::max();
++        } else {
++          stop_rumble();
+         }
+-        // The feed is back: republish absolute state so the new pad matches the
+-        // physical controller instead of waiting for the next button change.
+-        needs_full_frame_ = true;
+-        last_send = std::chrono::steady_clock::now();
+-        continue;
+       }
+-      published_ = state;
+-      last_send = std::chrono::steady_clock::now();
+-    } else if (keepalive) {
+-      if (!client_.send_keepalive()) {
++      next_rumble = now + 8ms;
++    }
++    if (now >= rumble_end) {
++      stop_rumble();
++    }
++
++    if (state || now >= next_keepalive) {
++      // Each feed frame replaces the entire state, including all held inputs.
++      const bool sent = state ? client_.send_frame(full_frame(*state)) : client_.send_keepalive();
++      if (!sent) {
++        stop_rumble();
+         if (!reconnect_locked()) {
+           break;
+         }
+-        needs_full_frame_ = true;
+-        last_send = std::chrono::steady_clock::now();
+-        continue;
+       }
+-      last_send = std::chrono::steady_clock::now();
++      now = Clock::now();
++      if (state) {
++        next_frame = now + frame_period;
++      }
++      next_keepalive = now + config_.keepalive_after;
+     }
+   }
+ 
++  stop_rumble();
+   client_.disconnect();
+   std::lock_guard lock(mutex_);
+   running_ = false;
+@@ -236,11 +233,6 @@ void PadSession::stop() {
+   if (thread_.joinable()) {
+     thread_.join();
+   }
+-  // Join the reader before closing the socket: it owns the read side, and
+-  // disconnect() also reads a Drained reply.
+-  if (rumble_thread_.joinable()) {
+-    rumble_thread_.join();
+-  }
+   client_.disconnect();
+   std::lock_guard lock(mutex_);
+   running_ = false;
+diff --git a/third-party/nexus-ojd/src/protocol.cpp b/third-party/nexus-ojd/src/protocol.cpp
+index 865ef6f..1820f63 100644
+--- a/third-party/nexus-ojd/src/protocol.cpp
++++ b/third-party/nexus-ojd/src/protocol.cpp
+@@ -31,6 +31,8 @@ std::string_view to_string(Persona persona) noexcept {
+       return "Generic";
+     case Persona::sdl_compatible:
+       return "SDLCompatible";
++    case Persona::game_controller_compatible:
++      return "GameControllerCompatible";
+   }
+   return "Generic";
+ }
+@@ -229,18 +231,24 @@ std::string build_frame(const Frame &frame) {
+   out.push_back('{');
+   append_api_and_kind(out, "Frame");
+ 
+-  if (!frame.buttons.empty()) {
+-    out.push_back(',');
+-    append_key(out, "buttons");
+-    out.push_back('[');
+-    for (std::size_t index = 0; index < frame.buttons.size(); ++index) {
+-      if (index != 0) {
+-        out.push_back(',');
++  auto append_pressed = [&](std::string_view key, bool directional) {
++    bool first = true;
++    for (Button button : frame.buttons) {
++      const bool is_dpad = button == Button::dpad_up || button == Button::dpad_down ||
++                           button == Button::dpad_left || button == Button::dpad_right;
++      if (is_dpad != directional) continue;
++      out.push_back(',');
++      if (first) {
++        append_key(out, key);
++        out.push_back('[');
++        first = false;
+       }
+-      detail::append_json_string(out, to_string(frame.buttons[index]));
++      detail::append_json_string(out, to_string(button));
+     }
+-    out.push_back(']');
+-  }
++    if (!first) out.push_back(']');
++  };
++  append_pressed("buttons", false);
++  append_pressed("dpad", true);
+ 
+   if (!frame.axes.empty()) {
+     out.push_back(',');
+diff --git a/third-party/nexus-ojd/src/state_mapping.cpp b/third-party/nexus-ojd/src/state_mapping.cpp
+index 019e6da..55986b4 100644
+--- a/third-party/nexus-ojd/src/state_mapping.cpp
++++ b/third-party/nexus-ojd/src/state_mapping.cpp
+@@ -1,7 +1,6 @@
+ #include "nexus/ojd/state_mapping.hpp"
+ 
+ #include <array>
+-#include <cmath>
+ #include <vector>
+ 
+ namespace nexus::ojd {
+@@ -63,18 +62,12 @@ double trigger_to_unit(std::uint8_t value, const MapOptions &options) {
+   return static_cast<double>(value) / 255.0;
+ }
+ 
+-bool nearly_equal(double left, double right) noexcept {
+-  // Stick quantisation is 1/32768, so this tolerance only ignores true no-ops.
+-  return std::fabs(left - right) < 0.0005;
+-}
+-
+ }  // namespace
+ 
+ namespace detail {
+ 
+ double stick_to_unit(std::int16_t value) noexcept {
+-  // Moonlight and OJD share the same sign convention (positive Y down), so this
+-  // is a pure scale. -32768 maps to -1.0 and 32767 maps to ~1.0.
++  // -32768 maps to -1.0 and 32767 maps to 1.0.
+   if (value < 0) {
+     return static_cast<double>(value) / 32768.0;
+   }
+@@ -88,43 +81,13 @@ Frame full_frame(const GamepadState &state, const MapOptions &options) {
+   frame.buttons = buttons_for(state.button_flags);
+   frame.axes = {
+       {Axis::left_stick_x, detail::stick_to_unit(state.lx)},
+-      {Axis::left_stick_y, detail::stick_to_unit(state.ly)},
++      {Axis::left_stick_y, -detail::stick_to_unit(state.ly)},
+       {Axis::right_stick_x, detail::stick_to_unit(state.rx)},
+-      {Axis::right_stick_y, detail::stick_to_unit(state.ry)},
++      {Axis::right_stick_y, -detail::stick_to_unit(state.ry)},
+       {Axis::left_trigger, trigger_to_unit(state.lt, options)},
+       {Axis::right_trigger, trigger_to_unit(state.rt, options)},
+   };
+   return frame;
+ }
+ 
+-Frame diff_frame(const GamepadState &previous, const GamepadState &current,
+-                 const MapOptions &options) {
+-  Frame frame;
+-
+-  // OJD frames are absolute: omitted controls are neutral, not "unchanged". So
+-  // a diff must still list held buttons, or they would drop on this frame.
+-  frame.buttons = buttons_for(current.button_flags);
+-
+-  const auto push_axis = [&frame, &options](Axis axis, double before, double after) {
+-    if (options.full_frames || !nearly_equal(before, after)) {
+-      frame.axes.push_back({axis, after});
+-    }
+-  };
+-
+-  push_axis(Axis::left_stick_x, detail::stick_to_unit(previous.lx),
+-            detail::stick_to_unit(current.lx));
+-  push_axis(Axis::left_stick_y, detail::stick_to_unit(previous.ly),
+-            detail::stick_to_unit(current.ly));
+-  push_axis(Axis::right_stick_x, detail::stick_to_unit(previous.rx),
+-            detail::stick_to_unit(current.rx));
+-  push_axis(Axis::right_stick_y, detail::stick_to_unit(previous.ry),
+-            detail::stick_to_unit(current.ry));
+-  push_axis(Axis::left_trigger, trigger_to_unit(previous.lt, options),
+-            trigger_to_unit(current.lt, options));
+-  push_axis(Axis::right_trigger, trigger_to_unit(previous.rt, options),
+-            trigger_to_unit(current.rt, options));
+-
+-  return frame;
+-}
+-
+ }  // namespace nexus::ojd
+diff --git a/third-party/nexus-ojd/src/sunshine_adapter.cpp b/third-party/nexus-ojd/src/sunshine_adapter.cpp
+index e568590..b6cd525 100644
+--- a/third-party/nexus-ojd/src/sunshine_adapter.cpp
++++ b/third-party/nexus-ojd/src/sunshine_adapter.cpp
+@@ -9,9 +9,10 @@
+ #include "nexus/ojd/sunshine_adapter.hpp"
+ #include "nexus/ojd/sunshine_bridge.hpp"
+ 
+-// Sunshine. Included after the bridge so this file fails loudly if the bridge
+-// header ever grows a Sunshine dependency.
+-#include "src/platform/common.h"
++#include <array>
++#include <memory>
++#include <mutex>
++#include <optional>
+ 
+ namespace nexus::ojd::sunshine {
+ 
+@@ -41,44 +42,98 @@ static_assert(moonlight::touchpad_button == platf::TOUCHPAD_BUTTON);
+ static_assert(moonlight::misc_button == platf::MISC_BUTTON);
+ }  // namespace
+ 
+-/// Sunshine entry point: allocate a virtual pad in `id.globalIndex`.
+-int alloc_gamepad(int slot) {
+-  // OJD creates the pad on the first frame, so allocation only records intent.
+-  // A failure surfaces on the first update, which is where OJD reports
+-  // permission and license problems.
+-  if (global_bridge().availability() != Availability::ready) {
+-    return -1;
++namespace {
++
++struct FeedbackRoute {
++  std::uint8_t client_index;
++  std::weak_ptr<platf::feedback_queue_t::element_type> queue;
++};
++
++struct FeedbackRoutes {
++  std::mutex mutex;
++  std::array<std::optional<FeedbackRoute>, kMaxVirtualPads> slots;
++
++  void send(int slot, const RumbleCommand &command) {
++    std::lock_guard lock(mutex);
++    const auto &route = slots[slot];
++    if (!route) {
++      return;
++    }
++    if (const auto queue = route->queue.lock()) {
++      queue->raise(platf::gamepad_feedback_msg_t::make_rumble(
++          route->client_index, command.set ? command.low_frequency : 0,
++          command.set ? command.high_frequency : 0));
++    }
+   }
+-  if (slot < 0 || slot >= kMaxVirtualPads) {
++};
++
++FeedbackRoutes &feedback_routes() {
++  static const auto routes = [] {
++    auto routes = std::make_shared<FeedbackRoutes>();
++    global_bridge().set_rumble_handler([routes](int slot, const RumbleCommand &command) {
++      routes->send(slot, command);
++    });
++    return routes;
++  }();
++  return *routes;
++}
++
++bool valid_slot(int slot) {
++  return slot >= 0 && slot < kMaxVirtualPads;
++}
++
++}  // namespace
++
++int alloc_gamepad(const platf::gamepad_id_t &id, const platf::feedback_queue_t &queue) {
++  if (!valid_slot(id.globalIndex) || global_bridge().availability() != Availability::ready) {
+     return -1;
+   }
++  auto &routes = feedback_routes();
++  std::lock_guard lock(routes.mutex);
++  routes.slots[id.globalIndex] = FeedbackRoute {id.clientRelativeIndex, queue};
+   return 0;
+ }
+ 
+-/// Sunshine entry point: release a virtual pad.
++bool rebind_gamepad(const platf::gamepad_id_t &id, const platf::feedback_queue_t &queue) {
++  if (!valid_slot(id.globalIndex)) {
++    return false;
++  }
++  auto &routes = feedback_routes();
++  std::lock_guard lock(routes.mutex);
++  auto &route = routes.slots[id.globalIndex];
++  if (!route) {
++    return false;
++  }
++  route = FeedbackRoute {id.clientRelativeIndex, queue};
++  return true;
++}
++
+ void free_gamepad(int slot) {
++  if (!valid_slot(slot)) {
++    return;
++  }
++  // Stop the OJD feed first. This lets its final zero-strength command reach
++  // the owning client's queue before the route is removed.
+   global_bridge().release(slot);
++  auto &routes = feedback_routes();
++  std::lock_guard lock(routes.mutex);
++  routes.slots[slot].reset();
+ }
+ 
+-/// Sunshine entry point: submit a full gamepad state.
+ bool submit_gamepad(int slot, const platf::gamepad_state_t &state) {
++  if (!valid_slot(slot)) {
++    return false;
++  }
++  {
++    auto &routes = feedback_routes();
++    std::lock_guard lock(routes.mutex);
++    if (!routes.slots[slot]) {
++      return false;
++    }
++  }
+   return global_bridge().update(
+       slot, state.buttonFlags, state.lt, state.rt,
+       state.lsX, state.lsY, state.rsX, state.rsY);
+ }
+ 
+-// Rumble is intentionally not wired to Sunshine's feedback queue yet.
+-//
+-// The obstacle is scope, not protocol: OJD reports rumble per pad, and the
+-// protocol layer parses it correctly, but Sunshine has one feedback queue per
+-// Moonlight session while these pads are process-global. The bridge therefore
+-// cannot tell which session owns a pad, and with several viewers connected a
+-// rumble for one player would be delivered to another (or to a queue that was
+-// already destroyed when its client disconnected).
+-//
+-// Wiring it safely needs the bridge to learn each session's gamepad slots and
+-// queue, which means plumbing session identity through the platform input
+-// entry points. Until that exists, rumble stays off for every pad rather than
+-// routed to the wrong controller. See COLLABORATION.md.
+-
+ }  // namespace nexus::ojd::sunshine
+diff --git a/third-party/nexus-ojd/src/sunshine_bridge.cpp b/third-party/nexus-ojd/src/sunshine_bridge.cpp
+index 6c40a82..bc10345 100644
+--- a/third-party/nexus-ojd/src/sunshine_bridge.cpp
++++ b/third-party/nexus-ojd/src/sunshine_bridge.cpp
+@@ -67,7 +67,8 @@ void GamepadBridge::ensure_pool_locked() {
+   config.socket_path = socket_path_;
+   config.token = token_;
+   config.token_name = token_name_;
+-  config.persona = Persona::sdl_compatible;
++  // NX2Apple reads the Xbox Wireless Controller through Apple GameController.
++  config.persona = Persona::game_controller_compatible;
+   // OJD plays a frame for at least 8 ms, so publishing faster gains nothing.
+   config.max_fps = 120;
+   config.keepalive_after = std::chrono::milliseconds(500);
+diff --git a/third-party/nexus-ojd/tests/ojd_client_test.cpp b/third-party/nexus-ojd/tests/ojd_client_test.cpp
+index 3dd2121..5d816a5 100644
+--- a/third-party/nexus-ojd/tests/ojd_client_test.cpp
++++ b/third-party/nexus-ojd/tests/ojd_client_test.cpp
+@@ -133,14 +133,16 @@ void test_hello_token_message() {
+ 
+ void test_frame_message() {
+   Frame frame;
+-  frame.buttons = {Button::south, Button::dpad_up};
++  frame.buttons = {Button::south, Button::dpad_up, Button::dpad_left, Button::east};
+   frame.axes = {{Axis::left_stick_x, -0.75}, {Axis::left_trigger, 1.0}};
+   frame.hold_milliseconds = 100;
+ 
+   const auto text = build_frame(frame);
+   check(text.find("\"kind\":\"Frame\"") != std::string::npos, "frame has kind");
+-  check(text.find("\"buttons\":[\"South\",\"DpadUp\"]") != std::string::npos,
++  check(text.find("\"buttons\":[\"South\",\"East\"]") != std::string::npos,
+         "frame renders buttons positionally");
++  check(text.find("\"dpad\":[\"DpadUp\",\"DpadLeft\"]") != std::string::npos,
++        "frame renders diagonal directions in the separate dpad field");
+   check(text.find("\"LeftStickX\":-0.75") != std::string::npos, "frame renders negative axis");
+   check(text.find("\"LeftTrigger\":1") != std::string::npos, "frame trims trailing zeros");
+   check(text.find("\"holdMilliseconds\":100") != std::string::npos, "frame renders hold");
+@@ -178,6 +180,9 @@ void test_keepalive_and_drain() {
+   check(build_feed_request(Persona::sdl_compatible).find("\"as\":\"SDLCompatible\"") !=
+             std::string::npos,
+         "feed request persona");
++  check(build_feed_request(Persona::game_controller_compatible).find(
++            "\"as\":\"GameControllerCompatible\"") != std::string::npos,
++        "feed request supports the Apple GameController profile");
+   check(build_feed_request(Persona::generic).find("\"as\":\"Generic\"") != std::string::npos,
+         "generic persona");
+ }
+@@ -309,15 +314,18 @@ void test_axis_scaling() {
+   GamepadState state;
+   state.lx = -32768;
+   state.ly = 32767;
++  state.ry = -32768;
+   const auto frame = full_frame(state);
+ 
+-  double left_x = 0, left_y = 0;
++  double left_x = 0, left_y = 0, right_y = 0;
+   for (const auto &axis : frame.axes) {
+     if (axis.axis == Axis::left_stick_x) left_x = axis.value;
+     if (axis.axis == Axis::left_stick_y) left_y = axis.value;
++    if (axis.axis == Axis::right_stick_y) right_y = axis.value;
+   }
+   check_eq(left_x, -1.0, "int16 min maps to -1.0");
+-  check(left_y > 0.999 && left_y <= 1.0, "int16 max maps to ~1.0");
++  check_eq(left_y, -1.0, "Moonlight full up maps to OJD negative Y");
++  check_eq(right_y, 1.0, "Moonlight full down maps to OJD positive Y");
+ 
+   GamepadState centered;
+   const auto neutral = full_frame(centered);
+@@ -345,35 +353,6 @@ void test_trigger_scaling() {
+   }
+ }
+ 
+-void test_diff_frame_keeps_held_buttons() {
+-  GamepadState previous;
+-  previous.button_flags = moonlight::a;
+-  GamepadState current;
+-  current.button_flags = moonlight::a;  // still held
+-
+-  const auto frame = diff_frame(previous, current);
+-  // OJD frames are absolute, so a held button must still be listed or it drops.
+-  check_eq(frame.buttons.size(), std::size_t{1}, "held button re-sent");
+-  check_eq(frame.axes.size(), std::size_t{0}, "unchanged axes omitted");
+-}
+-
+-void test_diff_frame_reports_changes() {
+-  GamepadState previous;
+-  GamepadState current;
+-  current.lx = 16000;
+-
+-  const auto frame = diff_frame(previous, current);
+-  check(frame.axes.size() >= 1, "changed axis emitted");
+-  bool found = false;
+-  for (const auto &axis : frame.axes) {
+-    if (axis.axis == Axis::left_stick_x) {
+-      found = true;
+-      check(axis.value > 0.4, "axis carries new value");
+-    }
+-  }
+-  check(found, "left stick x present");
+-}
+-
+ // -- fake endpoint ---------------------------------------------------------
+ 
+ /// A minimal endpoint that speaks the real handshake, so the client is tested
+@@ -410,6 +389,7 @@ class FakeEndpoint {
+ 
+   const std::string &path() const { return path_; }
+   void set_refuse_feed(std::string code) { refuse_code_ = std::move(code); }
++  void enable_timed_rumble() { timed_rumble_ = true; }
+   void set_no_control_scope(bool value) { omit_control_ = value; }
+   std::size_t frames_received() const { return frames_.load(); }
+   bool saw_keepalive() const { return keepalive_.load(); }
+@@ -513,7 +493,12 @@ class FakeEndpoint {
+       const std::string line = read_line(fd);
+       if (line.empty()) return;
+       if (line.find("\"kind\":\"Frame\"") != std::string::npos) {
+-        ++frames_;
++        if (++frames_ == 1 && timed_rumble_) {
++          const char *refresh = R"({"apiVersion":"openjoystickdriver/v1alpha2","kind":"RumbleCommand","type":"SetRumble","durationMilliseconds":40,"intensities":{"lowFrequency":23000,"highFrequency":41000}})";
++          send_line(fd, refresh);
++          std::this_thread::sleep_for(std::chrono::milliseconds(48));
++          send_line(fd, refresh);
++        }
+         last_frame_ = line;
+       } else if (line.find("\"kind\":\"KeepAlive\"") != std::string::npos) {
+         keepalive_ = true;
+@@ -528,6 +513,7 @@ class FakeEndpoint {
+   std::string path_;
+   std::string refuse_code_;
+   bool omit_control_ = false;
++  bool timed_rumble_ = false;
+   int listen_fd_ = -1;
+   std::thread thread_;
+   std::atomic<bool> stop_{false};
+@@ -670,6 +656,7 @@ void test_connect_missing_socket() {
+ 
+ void test_pad_session_round_trip() {
+   FakeEndpoint endpoint;
++  endpoint.enable_timed_rumble();
+   check(endpoint.start(), "endpoint starts");
+ 
+   SessionConfig config;
+@@ -678,6 +665,16 @@ void test_pad_session_round_trip() {
+   config.token_name = "n";
+   config.max_fps = 100;
+   config.keepalive_after = std::chrono::milliseconds(100);
++  std::atomic<int> rumble_starts{0};
++  std::atomic<int> rumble_stops{0};
++  config.on_rumble = [&](std::size_t slot, const RumbleCommand &feedback) {
++    if (slot == 0 && feedback.set && feedback.low_frequency == 23000 && feedback.high_frequency == 41000) {
++      ++rumble_starts;
++    }
++    if (slot == 0 && !feedback.set) {
++      ++rumble_stops;
++    }
++  };
+ 
+   PadPool pool(config);
+   GamepadState state;
+@@ -691,13 +688,31 @@ void test_pad_session_round_trip() {
+   }
+   check(endpoint.frames_received() >= 1, "session published a frame");
+ 
++  state.button_flags |= moonlight::b;
++  check(pool.update(0, state), "session accepts a button change while the stick is held");
++  for (int i = 0; i < 100 && endpoint.frames_received() < 2; ++i) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++  }
++  check(endpoint.frames_received() >= 2, "session published the second frame");
++
++
++
+   // KeepAlive must appear once the pad goes quiet.
+   for (int i = 0; i < 100 && !endpoint.saw_keepalive(); ++i) {
+     std::this_thread::sleep_for(std::chrono::milliseconds(10));
+   }
+   check(endpoint.saw_keepalive(), "keepalive sent while idle");
+ 
++  for (int i = 0; i < 100 && !rumble_stops; ++i) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(10));
++  }
++  check_eq(rumble_starts.load(), 1, "slightly late identical refresh does not restart rumble");
++  check_eq(rumble_stops.load(), 1, "rumble stops once when the refreshed duration expires");
++
+   pool.release_all();
++  endpoint.stop();
++  check(endpoint.last_frame_.find("\"LeftStickX\":0.488296") != std::string::npos,
++        "a button change preserves the held stick in the absolute frame");
+ }
+ 
+ }  // namespace
+@@ -728,8 +743,6 @@ int main() {
+   RUN(test_all_buttons_map);
+   RUN(test_axis_scaling);
+   RUN(test_trigger_scaling);
+-  RUN(test_diff_frame_keeps_held_buttons);
+-  RUN(test_diff_frame_reports_changes);
+   RUN(test_rumble_ignores_other_kinds);
+   RUN(test_parse_rumble_command);
+   RUN(test_parse_stop_rumble);
