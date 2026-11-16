@@ -1,0 +1,215 @@
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index ad3424b..f6c8be5 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -21,6 +21,11 @@ @protocol DmTemporalScalerOffsets <NSObject>
+ #include <sys/sysctl.h>
+ #include <fcntl.h>
+ #include <TargetConditionals.h>
++#if TARGET_OS_OSX
++#import <CoreVideo/CoreVideo.h>
++#import <IOSurface/IOSurface.h>
++#include <xpc/xpc.h>
++#endif
+ #if TARGET_OS_IPHONE
+ #include <os/proc.h>   // os_proc_available_memory: for the memory readout line
+ #endif
+@@ -14928,29 +14933,142 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
+     m4_end(en);
+     return up ? PRESENT_METALFX : PRESENT_STANDARD;
+ }
+-// The present's picture drawn into an offscreen texture (out: private, render target) the way present_now draws it into the drawable, MetalFX included, on the Metal 4 queue;
++// The present's picture drawn into an offscreen render target the way present_now draws it into the drawable, MetalFX included, on the Metal 4 queue;
+ // returns whether it was submitted. Completion reports the encoding kind, or PRESENT_FAILED on a GPU error. Resources remain resident and retained until GPU completion.
+-static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
++// cached_fx may be reused only when the caller keeps one render in flight.
++static int present_offscreen_m4_cached(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, fx_state *cached_fx, void (^done)(int)) {
+     id<MTL4CommandAllocator> al = [g_dev newCommandAllocator]; id<MTL4CommandBuffer> cb = [g_dev newCommandBuffer];
+     id<MTLBuffer> uvb = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared];
+     if (!al || !cb || !uvb) { MLOG("[RED] offscreen present: no command allocator or buffer"); return 0; }
+     id<MTLTexture> raw = present_raw_src(src);
+-    fx_state fx = {0};
++    fx_state temporary_fx = {0};
++    fx_state *fx = cached_fx ? cached_fx : &temporary_fx;
+     res_add(out); res_add(uvb); res_commit();
+     [cb beginCommandBufferWithAllocator:al];
+-    int kind = present_encode_m4(cb, raw, out, crop, uvb, &fx);
++    int kind = present_encode_m4(cb, raw, out, crop, uvb, fx);
+     [cb endCommandBuffer];
+-    if (!kind) { res_remove(out); res_remove(uvb); res_remove(fx.in); res_remove(fx.out); return 0; }
++    if (!kind) { res_remove(out); res_remove(uvb); res_remove(temporary_fx.in); res_remove(temporary_fx.out); return 0; }
+     MTL4CommitOptions *options = [MTL4CommitOptions new];
+     [options addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
+-        (void)al; (void)cb; (void)raw; (void)fx.sc;   // keep the Metal 4 commands, source view and scaler alive too
+-        res_remove(out); res_remove(uvb); res_remove(fx.in); res_remove(fx.out);
++        (void)al; (void)cb; (void)raw; (void)temporary_fx.sc;   // keep the Metal 4 commands, source view and scaler alive too
++        res_remove(out); res_remove(uvb); res_remove(temporary_fx.in); res_remove(temporary_fx.out);
+         if (f.error) { MLOG("[RED] offscreen present: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "offscreen present"); }
+         done(f.error ? PRESENT_FAILED : kind);
+     }];
+     [g_q4 commit:&cb count:1 options:options];
+     return 1;
+ }
++static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTexture> out, void (^done)(int)) {
++    return present_offscreen_m4_cached(src, crop, out, NULL, done);
++}
++#if TARGET_OS_OSX
++enum { RELAY_WIDTH = 1920, RELAY_HEIGHT = 1080, RELAY_POOL_LIMIT = 3 };
++static CVPixelBufferPoolRef g_relay_pool;
++static NSDictionary *g_relay_pool_limits;
++static xpc_connection_t g_relay_connection;
++static dispatch_queue_t g_relay_queue;
++static const char *g_relay_service;
++static _Atomic bool g_relay_busy;
++static uint64_t g_relay_sequence;
++static fx_state g_relay_fx;
++
++static void relay_read_options(void) {
++    const char *service = getenv("DM_STREAM_RELAY");
++    if (service && *service) g_relay_service = service;
++}
++
++static bool relay_enabled(void) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, relay_read_options);
++    return g_relay_service != NULL;
++}
++
++static void relay_start(void) {
++    NSDictionary *attributes = @{
++        (id)kCVPixelBufferWidthKey: @(RELAY_WIDTH),
++        (id)kCVPixelBufferHeightKey: @(RELAY_HEIGHT),
++        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
++        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
++        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
++    };
++    CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL,
++        (__bridge CFDictionaryRef)attributes, &g_relay_pool);
++    if (status != kCVReturnSuccess) {
++        MLOG("stream relay: could not create pixel buffer pool (%d)", status);
++        return;
++    }
++    g_relay_pool_limits = @{ (id)kCVPixelBufferPoolAllocationThresholdKey: @(RELAY_POOL_LIMIT) };
++    g_relay_queue = dispatch_queue_create("org.nx2apple.stream-relay", DISPATCH_QUEUE_SERIAL);
++    g_relay_connection = xpc_connection_create_mach_service(g_relay_service, g_relay_queue, 0);
++    if (!g_relay_connection) {
++        MLOG("stream relay: could not create connection to %s", g_relay_service);
++        return;
++    }
++    xpc_connection_set_event_handler(g_relay_connection, ^(xpc_object_t event) {
++        if (event == XPC_ERROR_CONNECTION_INVALID) MLOG("stream relay: connection invalid (%s)", g_relay_service);
++    });
++    xpc_connection_resume(g_relay_connection);
++    MLOG("stream relay: sending %dx%d BGRA frames to %s", RELAY_WIDTH, RELAY_HEIGHT, g_relay_service);
++}
++
++static void relay_release_frame(CVPixelBufferRef buffer) {
++    if (buffer) CVPixelBufferRelease(buffer);
++    atomic_store(&g_relay_busy, false);
++}
++
++static void relay_present(id<MTLTexture> src, const int crop[4]) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, relay_start);
++    if (!g_relay_connection || atomic_exchange(&g_relay_busy, true)) return;
++
++    CVPixelBufferRef buffer = NULL;
++    CVReturn status = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(kCFAllocatorDefault,
++        g_relay_pool, (__bridge CFDictionaryRef)g_relay_pool_limits, &buffer);
++    if (status != kCVReturnSuccess) {
++        if (status != kCVReturnWouldExceedAllocationThreshold)
++            MLOG("stream relay: could not allocate pixel buffer (%d)", status);
++        relay_release_frame(buffer);
++        return;
++    }
++
++    IOSurfaceRef surface = CVPixelBufferGetIOSurface(buffer);
++    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
++        width:RELAY_WIDTH height:RELAY_HEIGHT mipmapped:NO];
++    desc.storageMode = MTLStorageModeShared;
++    desc.usage = MTLTextureUsageRenderTarget;
++    id<MTLTexture> dst = surface ? [g_dev newTextureWithDescriptor:desc iosurface:surface plane:0] : nil;
++    if (!dst) {
++        MLOG("stream relay: could not create Metal texture from IOSurface");
++        relay_release_frame(buffer);
++        return;
++    }
++    uint64_t seq = ++g_relay_sequence;
++    if (!present_offscreen_m4_cached(src, crop, dst, &g_relay_fx, ^(int kind) {
++        if (kind == PRESENT_FAILED) {
++            relay_release_frame(buffer);
++            return;
++        }
++        uint64_t ready_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        xpc_object_t description = IOSurfaceCreateXPCObject(surface);
++        if (!description) {
++            relay_release_frame(buffer);
++            return;
++        }
++        xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
++        xpc_dictionary_set_string(message, "op", "frame");
++        xpc_dictionary_set_value(message, "surface", description);
++        xpc_dictionary_set_uint64(message, "seq", seq);
++        xpc_dictionary_set_uint64(message, "ts_ns", ready_ns);
++        // The receiver replies after its last read. Until then the pool must not reuse the bytes.
++        IOSurfaceIncrementUseCount(surface);
++        xpc_connection_send_message_with_reply(g_relay_connection, message, g_relay_queue, ^(xpc_object_t reply) {
++            (void)reply;
++            IOSurfaceDecrementUseCount(surface);
++            relay_release_frame(buffer);
++        });
++    })) relay_release_frame(buffer);
++}
++#endif
+ // Diagnostic readback and tests wait for the same asynchronous capture used by whole-window screenshots. A timeout leaves cleanup with the GPU completion handler.
+ static int present_offscreen_wait(id<MTLTexture> src, const int crop[4], id<MTLTexture> out) {
+     dispatch_semaphore_t sem = dispatch_semaphore_create(0); __block int kind = PRESENT_FAILED;
+@@ -15027,6 +15145,12 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     pthread_mutex_unlock(&g_shotq_mu);
+ 
+     if (atomic_load(&g_gpu_lost)) return 0;   // the display command buffer would be ignored too: take no drawable from the screen the front end is about to close
++#if TARGET_OS_OSX
++    if (relay_enabled()) {
++        relay_present(src, crop);
++        return 0;   // The relay copy has been submitted or dropped; the present queue can release this frame.
++    }
++#endif
+     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
+     if (!layer) return 0;
+     if (g_present_layer_resident != layer) { [g_q4 addResidencySet:layer.residencySet]; g_present_layer_resident = layer; }
+@@ -15241,6 +15365,9 @@ static CAFrameRateRange link_range(int mode) {
+     return NULL;
+ }
+ static void link_sync(void) {   // Called every frame by the game's present thread: aligns the display link object's state to g_dm_present_link and the power-saving mode (can change at run time)
++#if TARGET_OS_OSX
++    if (relay_enabled()) return;   // The relay consumes the game's present queue independently of any display.
++#endif
+     static int applied;
+     pthread_mutex_lock(&g_pq_mu);
+     int want = g_dm_present_link;
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index 772c456..4f0fa6a 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -21,7 +21,7 @@ $(MSL_H): $(wildcard ../msl/*.metal) ../tools/host_msl.py host_msl_force
+ 	$(MAKE) -C ../../host host_msl GAME=$(GAME)
+ .PHONY: host_msl_force
+ host_msl_force:
+-FW=-framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework UniformTypeIdentifiers
++FW=-framework Metal -framework MetalFX -framework Foundation -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreVideo -framework IOSurface -framework UniformTypeIdentifiers
+ # Host crash.c is linked in as well: the write-protect unit tests go through the same page-fault hook as production
+ # Tests that #include nvn_mtl.m link the rest of the NVN layer beside it (hle_nvn.c: memory pools, sparse pools, serials) and the host's large stack, with weak stubs of what they need of the host (t_host_stubs.c)
+ MTL_T_DEP=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index 71f54c4..dd855cb 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -80,7 +80,7 @@ endif
+ .PHONY: FORCE
+ FORCE:
+ dmhost: $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h romfs_image.h save_sync.h dm_input.h input_map.h input_preferences_mac.h pad_slots.h pad_map.h pad_motion.h steam_input.h controllers_mac.h hle_haptics.h haptics_apple.h rpduo_mac.h dualsense_usb.h motion_fusion.h motion_apple.h motion_pro.h motion_pro_mac.h pad_apple.h pad_hid.h pad_hid_mac.h pad_joycon.h pad_joycon_mac.h home_quit.h home_quit_mac.h ctrl_prompt.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB) $(DAV1D_LIB) $(MSL_H)
+-	clang $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) $(DAV1D_LIB) -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework CoreAudio -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
++	clang $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) $(DAV1D_LIB) -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework CoreAudio -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework ImageIO -framework UniformTypeIdentifiers
+ clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx and dav1d builds; dmhost_* and *.dSYM beside them, as in .gitignore)
+ 	rm -rf gen dmhost dmhost_* *.dSYM
+ .PHONY: clean

@@ -1,0 +1,209 @@
+diff --git a/cmake/compile_definitions/macos.cmake b/cmake/compile_definitions/macos.cmake
+index 0591a6f..3c53993 100644
+--- a/cmake/compile_definitions/macos.cmake
++++ b/cmake/compile_definitions/macos.cmake
+@@ -38,6 +38,7 @@ list(APPEND SUNSHINE_EXTERNAL_LIBRARIES
+         ${IOKIT_LIBRARY}
+         ${USER_NOTIFICATIONS_LIBRARY}
+         ${SCREEN_CAPTURE_KIT_LIBRARY}
++        "-framework IOSurface"
+         ${VIDEO_TOOLBOX_LIBRARY})
+ 
+ set(APPLE_PLIST_TEMPLATE "${SUNSHINE_SOURCE_ASSETS_DIR}/macos/build/Info.plist.in")
+diff --git a/src/platform/macos/display.mm b/src/platform/macos/display.mm
+index acab57c..fc37c87 100644
+--- a/src/platform/macos/display.mm
++++ b/src/platform/macos/display.mm
+@@ -8,12 +8,18 @@
+ #include <charconv>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstring>
+ #include <optional>
+ #include <string_view>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
++#import <IOSurface/IOSurface.h>
++#import <VideoToolbox/VideoToolbox.h>
++#include <xpc/xpc.h>
++
+ // local includes
+ #include "src/config.h"
+ #include "src/display_device.h"
+@@ -494,7 +500,158 @@ int dummy_img(img_t *img) override {
+     }
+   };
+ 
++  class relay_frame_source_t final: public sckit::frame_source_t {
++  public:
++    relay_frame_source_t(const char *service, int width, int height, OSType format):
++        _service(service), _width(width), _height(height), _format(format) {}
++
++    ~relay_frame_source_t() override {
++      stop();
++      if (_transfer) CFRelease(_transfer);
++      if (_pool) CFRelease(_pool);
++    }
++
++    bool start() override {
++      NSDictionary *attributes = @{
++        (NSString *) kCVPixelBufferWidthKey: @(_width),
++        (NSString *) kCVPixelBufferHeightKey: @(_height),
++        (NSString *) kCVPixelBufferPixelFormatTypeKey: @(_format),
++        (NSString *) kCVPixelBufferIOSurfacePropertiesKey: @ {},
++      };
++      if (CVPixelBufferPoolCreate(kCFAllocatorDefault, nullptr, (__bridge CFDictionaryRef) attributes, &_pool) != kCVReturnSuccess ||
++          VTPixelTransferSessionCreate(kCFAllocatorDefault, &_transfer) != noErr) {
++        BOOST_LOG(error) << "NX2Apple frame relay: could not create pixel transfer"sv;
++        return false;
++      }
++      VTSessionSetProperty(_transfer, kVTPixelTransferPropertyKey_DestinationColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
++      VTSessionSetProperty(_transfer, kVTPixelTransferPropertyKey_DestinationTransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
++      VTSessionSetProperty(_transfer, kVTPixelTransferPropertyKey_DestinationYCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
++
++      _connection = xpc_connection_create_mach_service(_service.c_str(), nullptr, 0);
++      if (!_connection) return false;
++      xpc_connection_set_event_handler(_connection, ^(xpc_object_t) {});
++      xpc_connection_resume(_connection);
++      return true;
++    }
++
++    void wait_frame(std::chrono::nanoseconds timeout) override {
++      const auto deadline = std::chrono::steady_clock::now() + timeout;
++      do {
++        @autoreleasepool {
++          auto request = xpc_dictionary_create(nullptr, nullptr, 0);
++          xpc_dictionary_set_string(request, "op", "next");
++          xpc_dictionary_set_uint64(request, "after", _sequence);
++          auto reply = xpc_connection_send_message_with_reply_sync(_connection, request);
++          xpc_release(request);
++          if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
++            if (auto object = xpc_dictionary_get_value(reply, "surface")) {
++              _sequence = xpc_dictionary_get_uint64(reply, "seq");
++              if (auto surface = IOSurfaceLookupFromXPCObject(object)) {
++                _latest = make_sample(surface, xpc_dictionary_get_uint64(reply, "ts_ns"));
++                CFRelease(surface);
++              }
++            }
++          } else if (reply && xpc_get_type(reply) == XPC_TYPE_ERROR) {
++            _sequence = 0;
++          }
++          if (reply) xpc_release(reply);
++          if (_latest) return;
++        }
++        std::this_thread::sleep_for(1ms);
++      } while (std::chrono::steady_clock::now() < deadline);
++    }
++
++    bool stopped() const override { return false; }
++    CMSampleBufferRef copy_latest_sample_buffer() override { return std::exchange(_latest, nullptr); }
++
++    void stop() override {
++      if (_connection) {
++        xpc_connection_cancel(_connection);
++        xpc_release(_connection);
++        _connection = nullptr;
++      }
++      if (_latest) {
++        CFRelease(_latest);
++        _latest = nullptr;
++      }
++    }
++
++  private:
++    CMSampleBufferRef make_sample(IOSurfaceRef surface, uint64_t timestamp) {
++      CVPixelBufferRef input {};
++      if (CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surface, nullptr, &input) != kCVReturnSuccess) return nullptr;
++
++      CVPixelBufferRef output {};
++      OSStatus status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _pool, &output);
++      if (status == noErr) {
++        status = VTPixelTransferSessionTransferImage(_transfer, input, output);
++      }
++      CVPixelBufferRelease(input);
++      if (status != noErr) {
++        if (output) CVPixelBufferRelease(output);
++        return nullptr;
++      }
++
++      const auto uptime = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++      const auto age = timestamp > 0 && timestamp <= uptime && uptime - timestamp < 1000000000ull ? uptime - timestamp : 0;
++      const auto pts = CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), CMTimeMake(age, 1000000000));
++      CMSampleTimingInfo timing {kCMTimeInvalid, pts, kCMTimeInvalid};
++      CMVideoFormatDescriptionRef description {};
++      CMSampleBufferRef result {};
++      if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, output, &description) == noErr) {
++        CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, output, description, &timing, &result);
++        CFRelease(description);
++      }
++      CVPixelBufferRelease(output);
++      return result;
++    }
++
++    std::string _service;
++    int _width, _height;
++    OSType _format;
++    xpc_connection_t _connection {};
++    CVPixelBufferPoolRef _pool {};
++    VTPixelTransferSessionRef _transfer {};
++    CMSampleBufferRef _latest {};
++    uint64_t _sequence {};
++  };
++
++  struct relay_display_t final: display_t {
++    std::string service;
++    OSType format {};
++    std::chrono::nanoseconds interval {SCKIT_FRAME_POLL_INTERVAL};
++
++    capture_e capture(const push_captured_image_cb_t &push, const pull_free_image_cb_t &pull, bool *) override {
++      relay_frame_source_t source {service.c_str(), width, height, format};
++      sckit::backend_policy_t unused_policy;
++      return sckit::run_capture_loop(source, unused_policy, push, pull, process_frame, interval);
++    }
++
++    std::shared_ptr<img_t> alloc_img() override { return std::make_shared<av_img_t>(); }
++    int dummy_img(img_t *img) override { return make_dummy_img(img, width, height, format, "NX2Apple frame relay"sv); }
++
++    std::unique_ptr<vt_encode_device_t> make_vt_encode_device(pix_fmt_e pix_fmt) override {
++      return vt::make_encode_device(
++        pix_fmt,
++        [this](int w, int h) { width = w; height = h; },
++        [this](int f) { format = f; }
++      );
++    }
++  };
++
+   std::shared_ptr<display_t> display(platf::mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
++    if (const auto *relay = std::getenv("RPDUO_FRAME_RELAY"); relay && *relay) {
++      if (hwdevice_type != platf::mem_type_e::videotoolbox) return nullptr;
++
++      auto result = std::make_shared<relay_display_t>();
++      result->service = relay;
++      result->width = result->env_width = config.width;
++      result->height = result->env_height = config.height;
++      result->format = videotoolbox_pixel_format(config);
++      if (config.framerate > 0) result->interval = std::chrono::nanoseconds {1s} / config.framerate;
++      BOOST_LOG(info) << "NX2Apple frame relay: "sv << config.width << 'x' << config.height << " @ "sv << config.framerate;
++      return result;
++    }
+     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {
+       BOOST_LOG(error) << "Could not initialize display with the given hw device type."sv;
+       return nullptr;
+diff --git a/src/platform/macos/misc.mm b/src/platform/macos/misc.mm
+index e4ed3c2..836468a 100644
+--- a/src/platform/macos/misc.mm
++++ b/src/platform/macos/misc.mm
+@@ -336,6 +336,10 @@ bool is_screen_capture_allowed() {
+   }
+ 
+   std::unique_ptr<deinit_t> init() {
++    // The relay backend consumes frames provided by the game instead of reading the system screen.
++    if (const auto *relay = getenv("RPDUO_FRAME_RELAY"); relay && *relay) {
++      return std::make_unique<deinit_t>();
++    }
+     if (!screen_recording_granted()) {
+       BOOST_LOG(error) << "No screen capture permission!"sv;
+       BOOST_LOG(error) << "Please activate Sunshine in System Settings -> Privacy & Security -> Screen & System Audio Recording"sv;

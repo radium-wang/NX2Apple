@@ -1,0 +1,128 @@
+--- a/dm/host/hle_audio.c
++++ b/dm/host/hle_audio.c
+@@ -8,6 +8,13 @@
+ #include <dispatch/dispatch.h>
+ #include <stdatomic.h>
+ #include <unistd.h>
++#if TARGET_OS_OSX
++#include <fcntl.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/un.h>
++#include <time.h>
++#endif
+ 
+ enum { FMT_PCM16 = 2, STATE_STARTED = 0, STATE_STOPPED = 1, RATE = 48000 };
+ enum { BK_NONE, BK_AU, BK_NULL };   // what is consuming an output's queue right now (aout.backend)
+@@ -147,8 +154,85 @@
+             *out++ = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
+         }
+         frames -= n;
++    }
++}
++
++#if TARGET_OS_OSX
++enum { RELAY_AUDIO_FRAMES = RATE / 200 };
++typedef struct {
++    uint64_t uptime_ns;
++    int16_t samples[RELAY_AUDIO_FRAMES * 2];
++} relay_audio_packet;
++_Static_assert(sizeof(relay_audio_packet) == 968, "unexpected stream audio packet layout");
++
++static int g_audio_relay_fd = -1;
++static struct sockaddr_un g_audio_relay_addr;
++static _Atomic(aout *) g_audio_relay_output;
++
++static void audio_relay_init(void) {
++    const char *path = getenv("DM_STREAM_AUDIO_SOCKET");
++    if (!path || !*path) return;
++    size_t size = strlen(path);
++    if (path[0] != '/' || size >= sizeof g_audio_relay_addr.sun_path) {
++        LOG("[RED] stream audio: invalid Unix socket path");
++        return;
++    }
++    char parent[sizeof g_audio_relay_addr.sun_path];
++    memcpy(parent, path, size + 1);
++    char *last = strrchr(parent, '/');
++    if (last == parent || !last[1]) {
++        LOG("[RED] stream audio: a private socket directory is required");
++        return;
++    }
++    *last = '\0';
++    struct stat st;
++    if (lstat(parent, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0077)) {
++        LOG("[RED] stream audio: the socket directory must be private and owned by this user");
++        return;
++    }
++    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
++    if (fd < 0 || fcntl(fd, F_SETFD, FD_CLOEXEC) || fcntl(fd, F_SETFL, O_NONBLOCK)) {
++        if (fd >= 0) close(fd);
++        LOG("[RED] stream audio: cannot open the nonblocking Unix socket");
++        return;
++    }
++    g_audio_relay_addr.sun_family = AF_UNIX;
++    memcpy(g_audio_relay_addr.sun_path, path, size + 1);
++    g_audio_relay_addr.sun_len = SUN_LEN(&g_audio_relay_addr);
++    g_audio_relay_fd = fd;
++    LOG("stream audio: sending 48 kHz stereo PCM to the local relay");
++}
++
++static bool audio_relay_enabled(void) {
++    static pthread_once_t once = PTHREAD_ONCE_INIT;
++    pthread_once(&once, audio_relay_init);
++    return g_audio_relay_fd >= 0;
++}
++
++static bool audio_relay_pull(aout *a) {
++    if (g_audio_relay_fd < 0 || (a->ch != 1 && a->ch != 2 && a->ch != 6)) return false;
++    // A stream uses one guest audio device. Keep later outputs paced without interleaving their packets.
++    aout *owner = NULL;
++    if (!atomic_compare_exchange_strong(&g_audio_relay_output, &owner, a) && owner != a) return false;
++
++    relay_audio_packet packet;
++    if (a->ch == 1) {
++        int16_t mono[RELAY_AUDIO_FRAMES];
++        pull(a, (uint8_t *)mono, sizeof mono);
++        for (unsigned i = 0; i < RELAY_AUDIO_FRAMES; i++) {
++            packet.samples[i * 2] = mono[i];
++            packet.samples[i * 2 + 1] = mono[i];
++        }
++    } else {
++        pull_device(a, (uint8_t *)packet.samples, sizeof packet.samples);
+     }
++    packet.uptime_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    // A missing or slow receiver must never stall the game's audio queue.
++    (void)sendto(g_audio_relay_fd, &packet, sizeof packet, MSG_DONTWAIT,
++                 (const struct sockaddr *)&g_audio_relay_addr, g_audio_relay_addr.sun_len);
++    return true;
+ }
++#endif
+ 
+ static _Atomic uint64_t g_render_calls;   // Cumulative sound card callbacks (lifecycle verification: must keep growing after resume)
+ uint64_t dm_audio_render_calls(void) { return atomic_load_explicit(&g_render_calls, memory_order_relaxed); }
+@@ -261,8 +345,15 @@
+     while (atomic_load_explicit(&a->null_run, memory_order_acquire)) {
+         t += 5000000; uint64_t now = now_ns();
+         if (t > now) usleep((useconds_t)((t - now) / 1000)); else if (now - t > 100000000) t = now;
++#if TARGET_OS_OSX
++        if (audio_relay_pull(a)) continue;
++#endif
+         pull(a, scratch, bytes);
+     }
++#if TARGET_OS_OSX
++    aout *owner = a;
++    atomic_compare_exchange_strong(&g_audio_relay_output, &owner, NULL);
++#endif
+     return NULL;
+ }
+ // Backend changes; callers hold g_aos_lock. pull() takes no lock, so joining a sink under it cannot deadlock
+@@ -424,6 +515,9 @@
+     pthread_create(&a->notify_th, NULL, event_notify, a);
+     if (ev) hle_bind_system_event(ev, 1);   // Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
+     char sb[64]; int use_au = real_audio();
++#if TARGET_OS_OSX
++    if (audio_relay_enabled()) use_au = 0;
++#endif
+     LOG("audio #%d OpenAudioOut %s channels %d %s%s (call site %s)", a->id, name ? name : "(default)", ch, use_au ? "real output" : "silent sink", ev ? "" : ", no release event (the game polls)", site(lr, sb, sizeof sb));
+     // The helper finishes (and is joined) before lifecycle/watchdog readers can find this output.
+     // Keep construction outside g_aos_lock: joining the helper can yield the guest core.

@@ -30,6 +30,42 @@ Set `controller = enabled` and `gamepad_driver = none` in Sunshine, and launch
 the rebuilt Mac game with `DM_RP_DUO=1`. Connect with the patched Artemis.
 See [the wire format](PROTOCOL.md) for the local socket and transport details.
 
+## Direct game video on macOS
+
+Apply `DirectVideoProducer.patch`, `DirectVideoWindowless.patch` and
+`DirectAudioProducer.patch` after the NX2Apple patches. Apply
+`DirectVideoSunshine.patch` and `DirectAudioSunshine.patch` after the
+Sunshine patches. The producer renders
+1920×1080 BGRA into a bounded pool of IOSurfaces. A same-user Mach service
+holds the latest GPU-completed frame. Sunshine converts it to the VideoToolbox
+input format and sends it with the existing GameStream video protocol.
+
+Build `source/RPFrameRelay.c` with
+`clang -fblocks -O2 -framework IOSurface -framework CoreFoundation`.
+Bootstrap a temporary launchd job in your GUI session with a unique name,
+that name as its single argument, and the same name in `MachServices`.
+Set `DM_STREAM_RELAY` on the game and `RPDUO_FRAME_RELAY` on a separate
+Sunshine process to that name. The macOS host runs an accessory without
+a game window and enables background GameController input. Use system
+controller mode to keep the virtual Xbox path.
+
+For stereo game audio, use the same absolute Unix socket path for
+`DM_STREAM_AUDIO_SOCKET` on the game and `RPDUO_STREAM_AUDIO_SOCKET`
+on Sunshine. The socket belongs in a user-owned directory with mode 0700.
+The game sends 48 kHz stereo PCM to Sunshine, which uses its normal Opus
+stream. Enable `stream_audio` in Sunshine. This direct profile uses the
+game's audio output and does not capture the system mix.
+
+Use a different Sunshine port and separate state when testing alongside
+desktop streaming. The direct source is enabled for the entire test process.
+The test profile used 1080p60 SDR over HEVC and stereo game audio.
+
+In Breath of the Wild 1.8.2, the median from a right-stick event to detectable
+scene movement in Android software screen samples was 112.6 ms via windowless
+delivery with game audio (12 samples, 98.3–124.7 ms). An earlier DeskPad
+trial at 60 fps measured 155.4 ms (12 samples, 135.2–170.6 ms). These
+readings depend on the image-change threshold and Android screen observation.
+
 ## RP Duo verification
 
 - Desktop and Breath of the Wild game video streamed via DeskPad and Apple hardware encoding.
