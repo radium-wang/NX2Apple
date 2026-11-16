@@ -22,8 +22,9 @@ The 64-byte payload uses little endian integers and IEEE-754 binary32 floats:
 Amplitudes are 0..1, frequencies 0..2000 Hz, all floats finite. Stop is zero
 amplitude on both bands of both motors. Refresh active state within its hold
 interval. On disconnect, focus loss or hold timeout the receiver must stop.
-Receiver timing uses local arrival time; the monotonic clocks are not assumed
-synchronized. Epoch and sequence preserve source ordering. A new connection
+Receiver playback uses its local clock. The client measures excess transit
+relative to the lowest clock offset observed in the current session, without
+assuming synchronized clocks. Epoch and sequence preserve source ordering. A new connection
 resets receiver ordering state. The raw receiver must retain all eight floats;
 playing only a mixed amplitude is explicitly a fallback, not HD playback.
 
@@ -31,6 +32,16 @@ NX2Apple emits game snapshots before controller-specific rendering.
 Artemis retains all eight floats. Its Android output selects a single
 supported frequency on capable firmware, or uses Droidplay's intensity
 curve when the system does not expose frequency control.
+
+The direct-video host uses a separate owner-only `direct-haptics.sock`.
+On builds with the independent direct rumble feature, the system controller
+still supplies input. The player-one game haptics are sent before the
+virtual Xbox or Core Haptics render them. Direct snapshots are refreshed
+every 30 ms with a 90 ms hold. Sunshine drops locally queued active
+snapshots older than 55 ms, removes local queue time from the hold, and
+stamps the frame with the forwarder's time. The client estimates added
+transit from recent session timestamps. Ordered stop snapshots still
+release the motor after a prolonged stall.
 
 On Mac, the same owner-only directory contains pad.sock for player-one
 input. Each 16-byte little-endian snapshot contains ASCII RPD1, the

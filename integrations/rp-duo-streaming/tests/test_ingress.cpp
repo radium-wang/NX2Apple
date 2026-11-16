@@ -7,6 +7,17 @@ int main() {
     frame[7]=1; assert(!rp_haptics_valid(frame,64)); frame[7]=0;
     float hz=164.81f; memcpy(frame+36,&hz,4);
     float bad=NAN; memcpy(frame+32,&bad,4); assert(!rp_haptics_valid(frame,64)); memset(frame+32,0,4);
+    unsigned char timed[64]; memcpy(timed,frame,64);
+    uint64_t source=1230000; uint32_t ttl=90000; float amplitude=.1f;
+    memcpy(timed+20,&source,8); memcpy(timed+28,&ttl,4); memcpy(timed+32,&amplitude,4);
+    assert(!rp_haptics_apply_host_age(timed,source-1));
+    assert(!rp_haptics_apply_host_age(timed,source+55001));
+    assert(rp_haptics_apply_host_age(timed,source+12000));
+    assert(rp_haptics_u32(timed+20)==source+12000 && rp_haptics_u32(timed+28)==78000);
+    assert(!memcmp(timed+36,&hz,4));
+    memset(timed+32,0,4);
+    assert(rp_haptics_apply_host_age(timed,source+150000));
+    assert(rp_haptics_u32(timed+20)==source+150000);
     std::string path="/private/tmp/rp-haptics-test-"+std::to_string(getpid())+".sock";
     {
         rpduo::haptics_ingress ingress(path); assert(ingress.ready());
@@ -21,5 +32,5 @@ int main() {
         struct stat st {}; assert(!stat(path.c_str(),&st) && (st.st_mode&0777)==0600);
     }
     assert(access(path.c_str(),F_OK)); unlink((path+".lock").c_str());
-    puts("raw validation, exact frequency preservation, FIFO transitions, permissions and exclusive socket: PASS");
+    puts("raw validation, host aging, exact frequency preservation, FIFO transitions and private socket: PASS");
 }

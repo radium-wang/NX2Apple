@@ -18,6 +18,7 @@ DEFAULT_STATE = Path.home() / ".config/sunshine/rp-duo-direct"
 RELAY_SERVICE = "org.nxnative.rpduo.direct.frames"
 MAX_REQUEST_BYTES = 64 * 1024
 RELAY_MARKERS = (b"DM_STREAM_RELAY\0", b"DM_STREAM_AUDIO_SOCKET\0")
+RAW_HAPTICS_MARKER = b"DM_RP_DUO_RAW_HAPTICS\0"
 
 # Settings supplied by GameStart, plus the game options from settings.tsv.
 # The native app launcher resolves its own data, saves, shaders and caches.
@@ -138,13 +139,14 @@ def find_launcher(app):
         with mmap.mmap(host_file.fileno(), 0, access=mmap.ACCESS_READ) as executable_bytes:
             if not all(executable_bytes.find(marker) >= 0 for marker in RELAY_MARKERS):
                 raise ValueError("This game build does not support direct video and audio. Build it with direct-streaming support first.")
+            raw_haptics = executable_bytes.find(RAW_HAPTICS_MARKER) >= 0
 
     defaults = info.get("DMDirectStreamDefaults", {})
     if not isinstance(defaults, dict) or any(
         not isinstance(value, str) or value not in PACK_DEFAULTS.get(key, ()) for key, value in defaults.items()
     ):
         raise ValueError("The selected game has invalid direct streaming defaults.")
-    return launcher, host, defaults
+    return launcher, host, defaults, raw_haptics
 
 
 def ensure_not_running(launcher, host):
@@ -172,7 +174,7 @@ def ensure_not_running(launcher, host):
             raise ValueError("This game is already running on the Mac. Quit it before starting direct streaming.")
 
 
-def launch_environment(state, defaults, overrides):
+def launch_environment(state, defaults, overrides, raw_haptics=False):
     """Retain launch options while assigning only the integration's own runtime values."""
     audio_socket = str(state / "game-audio.sock")
     if len(os.fsencode(audio_socket)) >= 104:  # Darwin sockaddr_un.sun_path, including its NUL.
@@ -195,6 +197,8 @@ def launch_environment(state, defaults, overrides):
         "DM_LAUNCHER": "0",
         "DM_AUDIO": "0",
     })
+    if raw_haptics:
+        environment["DM_RP_DUO_RAW_HAPTICS"] = "1"
     return environment
 
 
@@ -206,8 +210,8 @@ def main():
     try:
         state = args.state_dir.resolve()
         app, overrides = read_request(state)
-        launcher, host, defaults = find_launcher(app)
-        environment = launch_environment(state, defaults, overrides)
+        launcher, host, defaults, raw_haptics = find_launcher(app)
+        environment = launch_environment(state, defaults, overrides, raw_haptics)
         ensure_not_running(launcher, host)
         os.execve(str(launcher), [str(launcher)], environment)
     except (OSError, ValueError, plistlib.InvalidFileException, ExpatError) as error:

@@ -19,7 +19,7 @@ final class RetroidDuoRumble implements RawHapticsReceiver.Sink {
     private final Runnable refresh = this::refresh;
     private final Runnable expireRaw = this::expireRaw;
     private final Runnable finishStandard = this::finishStandard;
-    private long rawExpiresAt;
+    private long rawExpiresAt = Long.MAX_VALUE;
     private long standardStopNotBefore;
     private boolean standardStopPending;
     private int amplitude;
@@ -34,6 +34,7 @@ final class RetroidDuoRumble implements RawHapticsReceiver.Sink {
 
     synchronized void setControllerMagnitudes(short lowMotor, short highMotor) {
         if (closed) return;
+        cancelRawExpiry();
         int low = lowMotor & 0xffff;
         int high = highMotor & 0xffff;
         // Mix before reducing to the built-in motor's 8-bit amplitude. Zero alone means stop.
@@ -78,7 +79,10 @@ final class RetroidDuoRumble implements RawHapticsReceiver.Sink {
     }
 
     private synchronized void refresh() {
-        if (!closed && amplitude != 0 && SystemClock.uptimeMillis() >= refreshAt) play();
+        if (closed || amplitude == 0) return;
+        long now = SystemClock.uptimeMillis();
+        if (now >= rawExpiresAt) expireRaw();
+        else if (now >= refreshAt) play();
     }
 
     private void play() {
@@ -96,23 +100,31 @@ final class RetroidDuoRumble implements RawHapticsReceiver.Sink {
         for (int i = 0; i < bands.length; i += 2) power += bands[i] * bands[i];
         // Match Droidplay's intensity curve and use the same one-shot/cancel backend.
         float level = (float) Math.min(1, Math.sqrt(power));
-        setMagnitude(level < .02f ? 0 : Math.max(6, Math.round(level * 255)));
-        handler.removeCallbacks(expireRaw);
-        if (level >= .02f) {
-            rawExpiresAt = SystemClock.uptimeMillis() + frame.holdMicros / 1000;
-            handler.postAtTime(expireRaw, rawExpiresAt);
+        cancelRawExpiry();
+        if (level < .02f || frame.holdMicros == 0) {
+            setMagnitude(0);
+            return;
         }
+        rawExpiresAt = SystemClock.uptimeMillis() + (frame.holdMicros + 999) / 1000;
+        setMagnitude(Math.max(6, Math.round(level * 255)));
+        handler.postAtTime(expireRaw, rawExpiresAt);
+    }
+
+    private void cancelRawExpiry() {
+        rawExpiresAt = Long.MAX_VALUE;
+        handler.removeCallbacks(expireRaw);
     }
 
     private synchronized void expireRaw() {
-        if (SystemClock.uptimeMillis() >= rawExpiresAt) setMagnitude(0);
+        if (SystemClock.uptimeMillis() < rawExpiresAt) return;
+        cancelRawExpiry();
+        setMagnitude(0);
     }
 
     @Override public synchronized void stop() {
-        handler.removeCallbacks(expireRaw);
+        cancelRawExpiry();
         cancelStandardStop();
         standardStopNotBefore = 0;
-        rawExpiresAt = Long.MAX_VALUE;
         setMagnitude(0);
     }
 

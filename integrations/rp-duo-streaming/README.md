@@ -54,7 +54,9 @@ native launcher. Its own direct-enabled `dmhost` must match its title build
 and shader chain. The generic entry works across compatible Mac game builds.
 
 The embedded Mac build variant for 1.4.0 is based on the exact official
-bundled engine. Apply `DirectProducer-v1.4.0.patch` to a copy of that engine.
+bundled engine. Apply `DirectProducer-v1.4.0.patch` and
+`DirectHaptics-v1.4.0.patch` to a copy of that engine, in order. Copy
+`source/nx2apple/dm/host/rpduo_haptics_mac.h` to its `dm/host/` directory.
 Place the copy at `Contents/Resources/rpduo-engine` in the launcher, preserve
 the original engine ID in `.rpduo-base-engine-id` and give the copy a distinct
 valid `.engine-id`. The launcher seeds it only for Mac script builds using
@@ -63,8 +65,10 @@ the other build paths.
 
 ### Earlier engine packages
 
-Apply `DirectVideoProducer.patch`, `DirectVideoWindowless.patch` and
-`DirectAudioProducer.patch` after the NX2Apple patches. Apply
+Apply `DirectVideoProducer.patch`, `DirectVideoWindowless.patch`,
+`DirectAudioProducer.patch`, and `DirectHapticsLegacy.patch` after the NX2Apple
+patches. Copy both `source/nx2apple/dm/host/rpduo*_mac.h` headers to its
+`dm/host/` directory. Apply
 `DirectVideoSunshine.patch` and `DirectAudioSunshine.patch` after the
 Sunshine patches. The producer renders
 1920×1080 BGRA into a bounded pool of IOSurfaces. A same-user Mach service
@@ -78,7 +82,27 @@ that name as its single argument, and the same name in `MachServices`.
 Set `DM_STREAM_RELAY` on the game and `RPDUO_FRAME_RELAY` on a separate
 Sunshine process to that name. The macOS host runs an accessory without
 a game window and enables background GameController input. Use system
-controller mode to keep the virtual Xbox path.
+controller mode to keep the virtual Xbox input path.
+
+The direct game's player-one haptics use the separate `DM_RP_DUO_RAW_HAPTICS=1`
+route. It sends the game engine's two amplitudes and two frequencies per motor
+from `nn::hid` before Core Haptics can merge them. It keeps the engine's
+`DM_RUMBLE` on/off setting. Gain and cutoff belong to local controller rendering
+and do not transform raw packets. The direct route suppresses the duplicate
+virtual Xbox output for player one. Its separate local socket keeps the two
+stream sessions independent and its 90 ms hold limit retires stale effects.
+Non-direct launch and the legacy socket retain their existing behavior.
+
+The producer regression test connects the game vibration state machine to the
+raw wire encoder. It checks the two motors, all four bands (including a weak
+one), and prompt cancellation on suspension or rumble off:
+
+```sh
+clang -fblocks -I source/nx2apple/dm/host -I /path/to/engine/dm/host \
+  tests/DirectRawProducerTest.m /path/to/engine/dm/host/hle_haptics.c \
+  -o /tmp/direct-raw-producer-test
+/tmp/direct-raw-producer-test
+```
 
 For stereo game audio, use the same absolute Unix socket path for
 `DM_STREAM_AUDIO_SOCKET` on the game and `RPDUO_STREAM_AUDIO_SOCKET`

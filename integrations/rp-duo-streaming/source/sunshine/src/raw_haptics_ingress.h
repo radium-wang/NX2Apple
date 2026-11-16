@@ -12,6 +12,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #include <vector>
 
@@ -24,14 +25,14 @@ namespace rpduo {
 
   public:
     /** @brief Find/create a private per-user directory; reject symlinks or broad permissions. */
-    static std::string default_path() {
+    static std::string default_path(bool direct = false) {
       std::string dir = "/private/tmp/rpduo-stream-" + std::to_string(getuid());
       mkdir(dir.c_str(), 0700);
       struct stat st {};
       if (lstat(dir.c_str(), &st) || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 0777) != 0700) {
         return {};
       }
-      return dir + "/haptics.sock";
+      return dir + (direct ? "/direct-haptics.sock" : "/haptics.sock");
     }
 
     /** @brief Bind a user-owned socket; an existing live server is never replaced. */
@@ -98,7 +99,7 @@ namespace rpduo {
     }
 
     /** @brief Drain a bounded burst; preserve distinct transitions and reject malformed frames. */
-    std::vector<std::array<unsigned char, RP_HAPTICS_SIZE>> poll() {
+    std::vector<std::array<unsigned char, RP_HAPTICS_SIZE>> poll(bool expire_host_queue = false) {
       std::vector<std::array<unsigned char, RP_HAPTICS_SIZE>> frames;
       if (fd_ < 0) {
         return frames;
@@ -109,7 +110,8 @@ namespace rpduo {
         if (n < 0) {
           break;
         }
-        if (rp_haptics_valid(bytes.data(), static_cast<unsigned>(n))) {
+        if (rp_haptics_valid(bytes.data(), static_cast<unsigned>(n)) &&
+            (!expire_host_queue || rp_haptics_apply_host_age(bytes.data(), clock_gettime_nsec_np(CLOCK_MONOTONIC) / 1000))) {
           std::array<unsigned char, RP_HAPTICS_SIZE> frame {};
           memcpy(frame.data(), bytes.data(), frame.size());
           frames.push_back(frame);

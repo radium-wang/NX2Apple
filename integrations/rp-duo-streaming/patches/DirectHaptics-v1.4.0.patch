@@ -1,0 +1,84 @@
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -82,7 +82,7 @@
+ .PHONY: FORCE
+ FORCE:
+ # Makefile: a change to CFLAGS (or the compile line) rebuilds the host
+-dmhost: Makefile $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h romfs_image.h save_sync.h dm_input.h input_map.h input_preferences_mac.h pad_slots.h pad_map.h pad_motion.h steam_input.h controllers_mac.h hle_haptics.h haptics_apple.h pad_switch2_apple.h switch2_proto.h motion_fusion.h motion_apple.h motion_pro.h motion_pro_mac.h pad_joycon.h pad_joycon_mac.h pad_apple.h pad_hid.h pad_hid_mac.h home_quit.h home_quit_mac.h ctrl_prompt.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB) $(DAV1D_LIB) $(MSL_H)
++dmhost: Makefile $(SRC) $(GFX) ../third_party/stb_vorbis/stb_vorbis.c dm.h hle.h romfs_image.h save_sync.h dm_input.h input_map.h input_preferences_mac.h pad_slots.h pad_map.h pad_motion.h steam_input.h controllers_mac.h hle_haptics.h haptics_apple.h rpduo_haptics_mac.h pad_switch2_apple.h switch2_proto.h motion_fusion.h motion_apple.h motion_pro.h motion_pro_mac.h pad_joycon.h pad_joycon_mac.h pad_apple.h pad_hid.h pad_hid_mac.h home_quit.h home_quit_mac.h ctrl_prompt.h front.h $(GFX_H) $(GAME_H) $(GAME_STAMP) $(VPX_LIB) $(DAV1D_LIB) $(MSL_H)
+ 	clang $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc -o $@ $(SRC) $(GFX) $(VPX_LIB) $(DAV1D_LIB) -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework ImageIO -framework UniformTypeIdentifiers
+ clean:   # the host and everything make generates for it (gen/: the profile headers, the game stamp and the libvpx and dav1d builds; dmhost_* and *.dSYM beside them, as in .gitignore)
+ 	rm -rf gen dmhost dmhost_* *.dSYM
+--- a/dm/host/haptics_apple.m
++++ b/dm/host/haptics_apple.m
+@@ -11,6 +11,7 @@
+ #import <GameController/GameController.h>
+ #import <IOKit/IOKitLib.h>
+ #import <IOKit/hid/IOHIDDevice.h>
++#import "rpduo_haptics_mac.h"
+ #endif
+ #include <math.h>
+ #include <pthread.h>
+@@ -360,8 +361,18 @@
+         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 40*NSEC_PER_MSEC),queue,^{ native_apply(s,generation); });
+ }
+ static void apply(dm_haptic_state s) {
++#if !TARGET_OS_IPHONE
++    const uint64_t raw_time = s.player == 0 && rpduo_direct_haptics_enabled() ? rpduo_haptics_now_us() : 0;
++#endif
+     dispatch_async(queue, ^{ @autoreleasepool {
+         if (s.epoch != dm_haptics_epoch(s.player)) return;
++#if !TARGET_OS_IPHONE
++        if (raw_time) {
++            static uint64_t generation;
++            rpduo_direct_haptics_refresh(queue, s, ++generation, &generation, raw_time);
++            return;   // Do not send a second, lossy copy through the virtual controller.
++        }
++#endif
+         if (sinks[s.player]) { sink_apply(s); return; }   // the player is in range, as channels[] below assumes (hle_haptics.c)
+         if (nativeOutputs[s.player]) { native_apply(s,++outputGeneration[s.player]); return; }
+         NSArray<DmRumbleChannel *> *out = channels[s.player];
+@@ -390,6 +401,13 @@
+ static void configure(int p, GCController *controller, GCHapticsLocality locality) {
+     for (DmRumbleChannel *c in channels[p]) [c stop];
+     channels[p] = [NSMutableArray new];
++#if !TARGET_OS_IPHONE
++    if (!p && rpduo_direct_haptics_enabled()) {
++        dm_haptics_route(p, 1);
++        if (!controller) fprintf(stderr, "haptics: player 1 uses RP Duo direct four-band stream\n");
++        return;
++    }
++#endif
+     if (sinks[p]) { sink_silence(p); dm_haptics_route(p, 1); return; }
+ #if !TARGET_OS_IPHONE
+     ds4_release(p);
+@@ -483,6 +501,9 @@
+ }
+ void dm_haptics_apple_set_sink(int p, void (*sink)(const dm_haptic_state *)) {
+     if (!queue || p < 0 || p >= DM_PLAYERS) return;
++#if !TARGET_OS_IPHONE
++    if (!p && rpduo_direct_haptics_enabled()) return;   // Controller changes do not reset the direct output.
++#endif
+     pthread_mutex_lock(&routeLock);
+     dm_haptics_route(p, 0);   // invalidate queued work before changing the output
+     dispatch_sync(queue, ^{ sink_silence(p); sinks[p] = sink; configure(p, controllers[p], controllerLocalities[p]); });
+@@ -490,6 +511,9 @@
+ }
+ void dm_haptics_apple_controller_locality(int p, GCController *controller, GCHapticsLocality locality) {
+     if (!queue || p < 0 || p >= DM_PLAYERS) return;
++#if !TARGET_OS_IPHONE
++    if (!p && rpduo_direct_haptics_enabled()) return;   // Controller changes do not reset the direct output.
++#endif
+     pthread_mutex_lock(&routeLock);
+     BOOL sameLoc = (controllerLocalities[p] == locality) || (locality && [controllerLocalities[p] isEqualToString:locality]);
+     if (controllers[p] != controller || !sameLoc || outputOwners[p]) {
+@@ -503,6 +527,9 @@
+ }
+ void dm_haptics_apple_output(int p, id owner, dm_haptics_output output) {
+     if (!queue || p < 0 || p >= DM_PLAYERS) return;
++#if !TARGET_OS_IPHONE
++    if (!p && rpduo_direct_haptics_enabled()) return;   // Controller changes do not reset the direct output.
++#endif
+     if (!owner || !output) { dm_haptics_apple_controller(p,nil); return; }
+     pthread_mutex_lock(&routeLock);
+     if (outputOwners[p] != owner) {
