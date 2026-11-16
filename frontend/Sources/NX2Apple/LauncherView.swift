@@ -34,6 +34,7 @@ struct LauncherView: View {
     @StateObject var cloudGate = CloudSaveGate()   // the check of the cloud's save before a start (CloudSaveGate.swift, #957)
     @State var launchError: String?
     @State var directLaunchReady = false
+    @ObservedObject var directGame: DirectGameSession
     @State private var removing: LibraryGame?
     @State private var selectingGames = false   // the Build selected games sheet (BuildSelectedSheet.swift)
     @State private var deleting: LibraryGame?   // the game whose Delete sheet is open (DeleteGameSheet.swift)
@@ -76,7 +77,8 @@ struct LauncherView: View {
          activeBuildID: UUID? = nil, performStartupChecks: Bool = true, search: String? = nil, olderTools: Set<UUID> = [],
          manageOpen: Bool = false, padRing: Bool = false, onRunSetup: (() -> Void)? = nil,
          enterConsole: (() -> Void)? = nil, controllerDriver: AnyConsoleDriver? = nil, controls sharedControls: ControlLayout? = nil, recorder: BuildRecorder? = nil, qaPrompt: Bool = false, qaLaunching: Bool = false, qaSkippedOpen: Bool = false,
-         gamepad: LauncherGamepad? = nil, padFocus: PadFocus? = nil, artworkOpen: ArtworkSlot? = nil, artworkEditor: ArtworkEditor? = nil, artworkStore: ArtworkStore = .shared) {
+         gamepad: LauncherGamepad? = nil, padFocus: PadFocus? = nil, artworkOpen: ArtworkSlot? = nil, artworkEditor: ArtworkEditor? = nil,
+         artworkStore: ArtworkStore = .shared, directGame: DirectGameSession? = nil) {
         _padFocus = StateObject(wrappedValue: padFocus ?? PadFocus())
         _consolePrompt = State(initialValue: qaPrompt)   // visual QA: the connect prompt open at launch
         _skippedItemsOpen = State(initialValue: qaSkippedOpen)
@@ -97,6 +99,7 @@ struct LauncherView: View {
         if let search { _search = State(initialValue: search); _searching = State(initialValue: true) }   // visual QA: the bar with its field open
         _toolsAge = StateObject(wrappedValue: ToolsAge(older: olderTools))   // visual QA: games marked without a checkout to compare
         _gamepad = StateObject(wrappedValue: gamepad ?? LauncherGamepad())   // LauncherPerformanceTests presses its buttons
+        _directGame = ObservedObject(wrappedValue: directGame ?? DirectGameSession())
         let stores = stores ?? LauncherStores(); self.stores = stores
         _m = StateObject(wrappedValue: stores.build); _loc = ObservedObject(wrappedValue: stores.localizer)
         _updates = ObservedObject(wrappedValue: stores.appUpdates); _devices = ObservedObject(wrappedValue: stores.deviceStore)
@@ -165,7 +168,8 @@ struct LauncherView: View {
             }
         }
         .onChange(of: gamepad.connected) { connected in
-            if connected, enterConsole != nil, ConsolePrompt.shouldShow(enabled: ConsolePrompt.enabled, shown: ConsolePrompt.shownThisSession) {
+            if connected, directGame.active == nil, enterConsole != nil,
+               ConsolePrompt.shouldShow(enabled: ConsolePrompt.enabled, shown: ConsolePrompt.shownThisSession) {
                 ConsolePrompt.didShow()
                 consolePrompt = true
             }
@@ -325,7 +329,9 @@ struct LauncherView: View {
                               openDirect: { id in
                                   optionsFor = nil
                                   DispatchQueue.main.async {
-                                      if let game = library.games.first(where: { $0.id == id }) { primaryAction(game) }
+                                      if let game = library.games.first(where: { $0.id == id }), !isDirectGameRunning(game) {
+                                          primaryAction(game)
+                                      }
                                   }
                               }).environmentObject(padFocus).environmentObject(stores.saveSettings).environmentObject(stores.players).launcherDropdownHost() }
         }
@@ -444,6 +450,13 @@ struct LauncherView: View {
                 navigationTabs(compact: true, tabInset: 14, brandGap: 16)
             }
             Spacer(minLength: 8)
+            if directGame.active != nil && (page != .library || !(heroGame.map(isDirectGameRunning) ?? false)) {
+                Button(action: stopDirectGame) {
+                    Label(loc.t(directGame.stopping ? "launch.direct.stopping" : "launch.direct.stop"), systemImage: "stop.fill")
+                }
+                .buttonStyle(LauncherSecondaryButtonStyle())
+                .disabled(directGame.stopping)
+            }
             PlayerPicker(players: stores.players)   // whose saves Play uses (PlayerPicker.swift)
             searchField
             Button { newBuild() } label: {

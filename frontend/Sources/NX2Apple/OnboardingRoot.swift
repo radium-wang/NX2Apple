@@ -38,6 +38,7 @@ struct RootView: View {
     @State private var driver: LiveOnboardingDriver?
     @StateObject private var gamepad = LauncherGamepad()
     @ObservedObject var console: ConsoleCoordinator
+    var directGame: DirectGameSession? = nil
 
     var body: some View {
         Group {
@@ -57,7 +58,8 @@ struct RootView: View {
                             .transition(CalmTransition.console)
                     } else {
                         LauncherView(stores: stores, library: library, onRunSetup: runSetupAgain, enterConsole: { console.enter() },
-                                    controllerDriver: AnyConsoleDriver(shared.console), controls: shared.controls, recorder: shared.recorder)
+                                    controllerDriver: AnyConsoleDriver(shared.console), controls: shared.controls, recorder: shared.recorder,
+                                    directGame: directGame)
                             .transition(CalmTransition.desktop)
                     }
                 }

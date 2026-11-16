@@ -14,18 +14,28 @@ extension LauncherView {
         launching && game.primary == .play && (launchingGameID == nil || launchingGameID == game.id)
     }
 
+    func isDirectGameRunning(_ game: LibraryGame) -> Bool {
+        directGame.active?.matches(game) == true
+    }
+
+    func stopDirectGame() {
+        if !directGame.stop() { launchError = loc.t("launch.direct.stopFailed") }
+    }
+
     @ViewBuilder func heroPrimary(_ game: LibraryGame, compact: Bool) -> some View {
-        let macStarting = isLaunchingMacGame(game)
-        let title = macStarting ? loc.t("library.launching")
+        let directRunning = isDirectGameRunning(game)
+        let macStarting = !directRunning && isLaunchingMacGame(game)
+        let title = directRunning ? loc.t(directGame.stopping ? "launch.direct.stopping" : "launch.direct.stop")
+            : macStarting ? loc.t("library.launching")
             : (game.primary == .play ? loc.t("library.play")
                 : (game.primary == .openOnDevice ? String(format: loc.t("dev.open"), devices.deviceName(game.installedDevice))
                     : loc.t("library.setUpBuild")))
-        let symbol = game.primary == .play ? "play.fill" : (game.primary == .openOnDevice ? "iphone" : "hammer.fill")
+        let symbol = directRunning ? "stop.fill" : game.primary == .play ? "play.fill" : (game.primary == .openOnDevice ? "iphone" : "hammer.fill")
         let button = Button { primaryAction(game) } label: {
-            LauncherHeroActionLabel(title: title, symbol: symbol, loading: macStarting)
+            LauncherHeroActionLabel(title: title, symbol: symbol, loading: macStarting || (directRunning && directGame.stopping))
         }
         .buttonStyle(.plain).launcherHover(enabled: artworkEditor == nil && !launching)
-        .disabled(launching || (m.running && !game.isReady) || artworkEditor != nil)
+        .disabled(directRunning ? directGame.stopping : (launching || (m.running && !game.isReady) || artworkEditor != nil))
         .keyboardShortcut(.return, modifiers: [])
         .padTarget("hero.play", scope: "main", radius: 30) { if !launching { primaryAction(game) } }
         if let version = game.playVersion ?? game.unbuiltVersion {
@@ -84,6 +94,10 @@ extension LauncherView {
     }
 
     func primaryAction(_ game: LibraryGame) {
+        if isDirectGameRunning(game) {
+            stopDirectGame()
+            return
+        }
         if game.primary == .openOnDevice {
             openOnDevice(game)
             return

@@ -8,9 +8,8 @@ import NXCore
 /// back, X opens the selected game's launch options and Y opens the Manage menu. On an Xbox or PlayStation controller A is the
 /// bottom button (the cross), on a Nintendo-layout controller it is the one on the right, as its player expects. This is the
 /// menus only: what a game receives is the Controls page's layout (By label or By position, #70), which this does not change.
-/// The D-pad or left stick moves (held, it repeats), L and R switch the pages. Input counts only while the launcher is the active app: a game it
-/// started is in front then, and GameController gives a controller's input to the app in front, so the launcher never
-/// acts behind a running game.
+/// The D-pad or left stick moves (held, it repeats), L and R switch the pages. A local game takes the foreground.
+/// A direct-stream game has no window, so its session reserves controller input from launcher navigation.
 final class LauncherGamepad: ObservableObject {
     enum Action: Equatable { case left, right, up, down, a, b, x, y, l, r, plus, select }
 
@@ -18,6 +17,15 @@ final class LauncherGamepad: ObservableObject {
     /// `select` is the Select-type button (DualShock Share, DualSense Create, Xbox View, Nintendo Minus): GameController's
     /// `buttonOptions`. The system does not claim it, so it always reaches the app. The desktop launcher opens console mode with it.
     private static weak var inputOwner: LauncherGamepad?
+    private static var reservedForDirectStream = false
+
+    @MainActor static func reserveForDirectStream(_ reserved: Bool) {
+        guard reservedForDirectStream != reserved else { return }
+        reservedForDirectStream = reserved
+        inputOwner?.inputGeneration += 1
+        inputOwner?.stopRepeat()
+    }
+
     private var action: (Action) -> Void = { _ in }
     var perform: (Action) -> Void {
         get { action }
@@ -227,7 +235,7 @@ final class LauncherGamepad: ObservableObject {
     }
 
     private func read(_ raw: RawPadInput, controller: String, isJoyCon: Bool) {
-        let eligible = appIsActive() && Self.inputOwner === self
+        let eligible = acceptsInput
         let generation = inputGeneration
         let groups = Self.states(controller: controller, input: raw, splitJoyCon: false)
         if edges.syncSplitMode(baseController: controller, split: false, groups: groups) {
@@ -239,7 +247,7 @@ final class LauncherGamepad: ObservableObject {
             for action in pressed {
                 let subID = group.controller
                 DispatchQueue.main.async {
-                    guard eligible, generation == self.inputGeneration, self.appIsActive(), Self.inputOwner === self else { return }
+                    guard eligible, generation == self.inputGeneration, self.acceptsInput else { return }
                     if let capture = self.capture, capture(subID, action) { return }
                     self.fire(action)
                     if [.left, .right, .up, .down].contains(action) { self.startRepeat(action, controller: subID) }
@@ -249,10 +257,13 @@ final class LauncherGamepad: ObservableObject {
         }
     }
 
-    private func fire(_ action: Action) { if appIsActive(), Self.inputOwner === self { perform(action) } }
+    private var acceptsInput: Bool { !Self.reservedForDirectStream && appIsActive() && Self.inputOwner === self }
+
+    private func fire(_ action: Action) { if acceptsInput { perform(action) } }
 
     /// A held direction repeats after 0.4 s, every 0.12 s.
     private func startRepeat(_ action: Action, controller: String) {
+        guard acceptsInput else { return }
         stopRepeat()
         repeating = action
         repeatingController = controller

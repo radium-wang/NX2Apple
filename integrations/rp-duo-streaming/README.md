@@ -80,6 +80,19 @@ The game sends 48 kHz stereo PCM to Sunshine, which uses its normal Opus
 stream. Enable `stream_audio` in Sunshine. This direct profile uses the
 game's audio output and does not capture the system mix.
 
+Sunshine gathers 25 ms of game audio before playing it so normal timing
+variation on the Mac does not insert silent blocks. If the audio runs out,
+the relay briefly fades and refills before playing again. The log reports
+underruns, overruns and stale packets when the stream ends. Existing games
+use the new buffer with an updated Sunshine binary.
+
+The buffer regression test runs against the patched Sunshine source tree:
+
+```sh
+clang++ -std=c++23 -I /path/to/Sunshine tests/DirectAudioBufferTest.cpp -o /tmp/direct-audio-test
+/tmp/direct-audio-test
+```
+
 Use a different Sunshine port and separate state when testing alongside
 desktop streaming. The direct source is enabled for the entire test process.
 The test profile used 1080p60 SDR over HEVC and stereo game audio.

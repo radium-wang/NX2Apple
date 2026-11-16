@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import NXCore
 import NXLauncher
@@ -21,6 +22,7 @@ struct NX2AppleApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
     @StateObject private var console = ConsoleCoordinator()
     @StateObject private var session = LauncherSession()
+    @StateObject private var directGame = DirectGameSession(monitor: true)
 
     var body: some Scene {
         WindowGroup("NX2Apple") {
@@ -29,7 +31,7 @@ struct NX2AppleApp: App {
                 OnboardingDemoHost(scenario: scenario)
             } else if let scenario = ProcessInfo.processInfo.environment["NSPB_CONSOLE_DEMO"].flatMap(MockConsoleDriver.Scenario.init(rawValue:)) {
                 ConsoleDemoView(scenario: scenario)
-            } else { RootView(shared: session, console: console) }
+            } else { RootView(shared: session, console: console, directGame: directGame) }
         }
             .windowStyle(.hiddenTitleBar)
             .defaultSize(width: 1280, height: 900)
@@ -39,6 +41,10 @@ struct NX2AppleApp: App {
                 CommandGroup(after: .toolbar) {
                     Button(L10n.string(console.active ? "console.menuLeave" : "console.entry", Lang.initial())) { console.toggle() }
                         .keyboardShortcut("k", modifiers: [.command, .option]).disabled(!console.available && !console.active)
+                    Button(L10n.string("launch.direct.stop", Lang.initial())) {
+                        if !directGame.stop() { NSSound.beep() }
+                    }
+                    .disabled(directGame.active == nil || directGame.stopping)
                 }
             }
     }

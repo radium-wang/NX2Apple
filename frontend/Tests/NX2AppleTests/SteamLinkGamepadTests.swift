@@ -97,6 +97,33 @@ import GameController
         XCTAssertEqual(actions, 2)
     }
 
+    func testDirectStreamReservesControllerPressesAndStopsRepeats() async {
+        let source = SteamLinkGamepads(observeSystem: false)
+        let pad = LauncherGamepad(steam: source, observeSystem: false, appIsActive: { true })
+        var actions: [LauncherGamepad.Action] = [], captured: [LauncherGamepad.Action] = []
+        pad.perform = { actions.append($0) }
+        pad.capture = { _, action in captured.append(action); return false }
+        defer { LauncherGamepad.reserveForDirectStream(false); pad.deactivate() }
+
+        send(button(15), id: "held-right", source: source)
+        await drain()
+        send(button(1), id: "pending-confirm", source: source)
+        LauncherGamepad.reserveForDirectStream(true)
+        send(button(9), id: "held-menu", source: source)
+        await drain()
+        LauncherGamepad.reserveForDirectStream(false)
+
+        send(button(9), id: "held-menu", source: source)
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertEqual(actions, [.right], "queued presses and repeats must not survive the game session")
+        XCTAssertEqual(captured, [.right], "the launcher controller editor must not see game presses")
+
+        send(SteamVirtualGamepad(), id: "held-menu", source: source)
+        send(button(9), id: "held-menu", source: source)
+        await drain()
+        XCTAssertEqual(actions, [.right, .plus], "a fresh press can navigate after the game ends")
+    }
+
     func testDesktopConsoleDesktopRoutesToOneView() async {
         let source = SteamLinkGamepads(observeSystem: false)
         let desktop = LauncherGamepad(steam: source, observeSystem: false, appIsActive: { true })

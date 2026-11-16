@@ -6,6 +6,7 @@ enum DirectStream {
     static let displayValue = "rpduo-direct"
     private static let frames = "org.nxnative.rpduo.direct.frames"
     private static let sunshine = "org.nxnative.rpduo.direct.sunshine"
+    static let stateDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/sunshine/rp-duo-direct")
 
     enum Failure: Error {
         case unavailable, unsupported
@@ -42,7 +43,7 @@ enum DirectStream {
     static func prepare(app: String, environment: [String: String]) async throws {
         let path = URL(fileURLWithPath: app).resolvingSymlinksInPath()
         guard hostSupportsDirect(path) else { throw Failure.unsupported }
-        let state = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/sunshine/rp-duo-direct")
+        let state = stateDirectory
         let domain = "gui/\(getuid())"
         for service in [frames, sunshine] {
             let plist = state.appendingPathComponent(service + ".plist")
