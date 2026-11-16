@@ -18,7 +18,7 @@ index c706dbf..3346727 100644
              minifyEnabled true
              proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
 diff --git a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
-index b084917..fc8d9d0 100755
+index b084917..734a4cb 100755
 --- a/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
 +++ b/app/src/main/java/com/limelight/binding/input/ControllerHandler.java
 @@ -127,6 +127,7 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
@@ -55,19 +55,20 @@ index b084917..fc8d9d0 100755
          deviceVibrator.cancel();
      }
  
-@@ -736,7 +749,10 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+@@ -736,7 +749,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
          context.hasPaddles = MoonBridge.guessControllerHasPaddles(context.vendorId, context.productId);
          context.hasShare = MoonBridge.guessControllerHasShareButton(context.vendorId, context.productId);
  
 -        if (prefConfig.enableDeviceRumble) {
++        // Retroid firmware exposes the same built-in pad under either controller mode.
 +        boolean builtInRetroidController = retroidDuoRumble != null
-+                && dev.getVendorId() == 0x2022 && dev.getProductId() == 0x3001
-+                && "Retroid Pocket Controller".equals(devName);
++                && dev.getVendorId() == 0x2022
++                && (dev.getProductId() == 0x3001 || dev.getProductId() == 0x3002);
 +        if (prefConfig.enableDeviceRumble || builtInRetroidController) {
              context.vibrator = deviceVibrator;
          } else {
              // Try to use the InputDevice's associated vibrators first
-@@ -2113,6 +2129,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
+@@ -2113,6 +2130,11 @@ public class ControllerHandler implements InputManager.InputDeviceListener, UsbD
          short highFreqMotorMSB = (short)((highFreqMotor >> 8) & 0xFF);
          int simulatedAmplitude = Math.min(255, (int)((lowFreqMotorMSB * 0.80) + (highFreqMotorMSB * 0.33)));
  

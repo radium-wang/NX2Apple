@@ -44,3 +44,44 @@ See [the wire format](PROTOCOL.md) for the local socket and transport details.
 The tests use the same local sockets as the production bridge. Keep the
 game closed when running the independent input receiver and test one controller
 at a time. Android event device numbers vary by device and boot.
+
+## System controller mode
+
+Apply `sunshine-system-ojd.patch` alongside `sunshine.patch` to reproduce
+the tested OpenJoystickDriver report mapping and rumble handling. Install
+the signed free OpenJoystickDriver and use its local socket with a
+Sunshine-only read/control token. Keep the token in the local configuration
+and leave the WebSocket disabled. Select `gamepad_driver = virtualhid`
+and keep `controller = enabled`. The tested fork selects OpenJoystickDriver
+when its endpoint and token are configured. Existing paired Artemis clients
+send the same controller packets.
+
+Run NX2Apple with `DM_RP_DUO=0` for system-only tests. This prevents the
+opt-in raw path from duplicating the normal GameController haptic output.
+The Artemis patch recognizes the Duo's native and Xbox modes (2022:3001 and
+2022:3002) for routing ordinary vibration to the built-in vibrator.
+
+The macOS observer and Edge 9slab page detected a standard Xbox Wireless
+Controller. The separate `tests/gamepad.html` exercised the browser Gamepad
+API and produced a 306 ms effect from a 300 ms request. Direct Xbox HID
+output reports produced 49, 52 and 55 ms pulses. Breath of the Wild loaded
+a disposable save with the system controller, accepted a sustained
+diagonal stick plus jump, and sent two haptic effects during travel that
+played on Duo for 107 and 117 ms. The 9slab page's own vibration button did
+not produce a matched motor event in the test. This mode uses ordinary
+rumble through macOS; it does not expose programmable frequency on the Duo.
+
+On a 1920×1080, 60 Hz DeskPad stream, device input submission to macOS
+GameController callback took 10.18 ms median, 18.41 ms p95 and 21.63 ms max
+over 32 samples (clock alignment uncertainty ±3.87 ms). The independent
+browser page changed color in response to D-pad input. Continuous Android
+compositor sampling of 16 changes yielded a 76.5 ms median and a 60.6–94.3 ms
+range. This includes browser work and the sampling overhead; it does not
+measure panel scanout or the timing of the same action inside a game.
+
+`tests/observe.swift` listens to system GameController events.
+`tests/measure.py` uses the Android NDK-built `PadLatencyAndroid.c` input
+sender and the macOS observer. `tests/measure-display.py` additionally
+uses the Android NDK-built `screen-frames.c` to observe the test page on
+the streaming display. These test programs are installed temporarily in
+Android's local debug directory and do not change the game or firmware.
